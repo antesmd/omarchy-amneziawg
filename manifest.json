@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "glafeara.wireguard",
+  "name": "WireGuard",
+  "version": "1.1.0",
+  "author": "say10",
+  "license": "MIT",
+  "description": "WireGuard status, config import, config switching, and quick toggle in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "WireGuard",
+    "description": "Toggle WireGuard, import .conf files, and switch between configs from ~/.config/wireguard.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaults": {
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 3600,
+        "step": 1,
+        "defaultValue": 10
+      }
+    ]
+  }
+}

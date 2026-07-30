@@ -1,0 +1,647 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+Panel {
+  id: root
+  moduleName: "glafeara.wireguard"
+  ipcTarget: "glafeara.wireguard"
+  manageIpc: false
+
+  property string focusSection: "header"
+  property int configIndex: 0
+  property bool cursorActive: false
+  // Config name awaiting delete confirmation; non-empty opens the dialog.
+  property string pendingDelete: ""
+  // Incoming config awaiting a name; "file" | "text" | "" (no prompt open).
+  property string importKind: ""
+  property string importPayload: ""
+  property string importName: ""
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color urgent: bar ? bar.urgent : Color.urgent
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property color iconColor: wireguard.active ? foreground : dim
+  readonly property color barIconColor: wireguard.active ? barForeground : Qt.darker(barForeground, 1.55)
+  readonly property string toggleHint: wireguard.active
+    ? "Disconnect"
+    : (wireguard.toggleTarget !== "" ? "Connect " + wireguard.toggleTarget : "Connect")
+  readonly property bool headerHasCursor: cursorActive && focusSection === "header" && wireguard.configs.length > 0
+
+  readonly property bool importPrompt: importKind !== ""
+  readonly property string importNameClean: importName.trim()
+  readonly property bool importNameValid: wireguard.isValidName(importNameClean)
+  readonly property bool importReplaces: importNameValid && wireguard.configs.indexOf(importNameClean) !== -1
+  readonly property string importSourceLabel: importKind === "text"
+    ? "Import from clipboard"
+    : "Import " + String(importPayload).split("/").pop()
+  readonly property string importHintText: !importNameValid
+    ? "Up to 15 characters: letters, digits and . _ - = +"
+    : (importReplaces
+      ? "Replaces the existing " + importNameClean + ".conf"
+      : "Saves as " + wireguard.configsDir + "/" + importNameClean + ".conf")
+
+  function ensureCursor() {
+    if (wireguard.configs.length === 0) {
+      focusSection = "header"
+      configIndex = 0
+      return
+    }
+    if (focusSection !== "configs" && focusSection !== "header") focusSection = "configs"
+    if (configIndex >= wireguard.configs.length) configIndex = Math.max(0, wireguard.configs.length - 1)
+    if (configIndex < 0) configIndex = 0
+  }
+
+  function moveCursor(dx, dy) {
+    cursorActive = true
+    ensureCursor()
+    if (dy === 0) return
+    if (focusSection === "header") {
+      if (dy > 0 && wireguard.configs.length > 0) {
+        focusSection = "configs"
+        configIndex = 0
+        scrollCursorIntoView()
+      }
+      return
+    }
+    if (focusSection === "configs") {
+      if (dy < 0 && configIndex === 0) {
+        setHeaderCursor()
+        return
+      }
+      configIndex = Math.max(0, Math.min(wireguard.configs.length - 1, configIndex + dy))
+      scrollCursorIntoView()
+    }
+  }
+
+  function setHeaderCursor() {
+    cursorActive = true
+    focusSection = "header"
+    if (panelFlick) panelFlick.contentY = 0
+  }
+
+  function setConfigCursor(index) {
+    cursorActive = true
+    focusSection = "configs"
+    configIndex = index
+    scrollCursorIntoView()
+  }
+
+  function selectedConfig() {
+    if (wireguard.configs.length === 0) return ""
+    return wireguard.configs[Math.max(0, Math.min(configIndex, wireguard.configs.length - 1))]
+  }
+
+  function activateConfig(name) {
+    if (wireguard.busy || !name) return
+    if (wireguard.isActive(name)) wireguard.disconnectOne(name)
+    else wireguard.connectTo(name)
+  }
+
+  function activateCursor() {
+    ensureCursor()
+    if (focusSection === "header") wireguard.toggle()
+    else if (focusSection === "configs") activateConfig(selectedConfig())
+  }
+
+  function requestDelete(name) {
+    if (wireguard.busy || !name) return
+    pendingDelete = String(name)
+  }
+
+  function beginImport(kind, payload, suggested) {
+    importKind = String(kind)
+    importPayload = String(payload)
+    // A sanitized provider filename can come back empty ("~/VPN (1).conf");
+    // fall back to a free wgN rather than opening the prompt on nothing.
+    importName = suggested !== "" ? String(suggested) : wireguard.suggestName()
+  }
+
+  function cancelImport() {
+    importKind = ""
+    importPayload = ""
+    importName = ""
+  }
+
+  function confirmImport() {
+    if (!importNameValid) return
+    var kind = importKind
+    var payload = importPayload
+    var name = importNameClean
+    cancelImport()
+    if (kind === "file") wireguard.importFile(payload, name)
+    else if (kind === "text") wireguard.importText(payload, name)
+  }
+
+  function scrollCursorIntoView() {
+    if (focusSection !== "configs" || !configColumn) return
+    var item = configColumn.children[configIndex]
+    if (!panelFlick || !item) return
+    Qt.callLater(function() {
+      if (!item) return
+      var margin = Style.space(6)
+      var point = item.mapToItem(panelFlick.contentItem, 0, 0)
+      var top = point.y
+      var bottom = top + item.height
+      var viewTop = panelFlick.contentY
+      var viewBottom = viewTop + panelFlick.height
+      var maxY = Math.max(0, panelFlick.contentHeight - panelFlick.height)
+      if (top < viewTop + margin) panelFlick.contentY = Math.max(0, top - margin)
+      else if (bottom > viewBottom - margin) panelFlick.contentY = Math.min(maxY, bottom + margin - panelFlick.height)
+    })
+  }
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
+  onOpenedChanged: {
+    pendingDelete = ""
+    cancelImport()
+    if (opened) {
+      cursorActive = false
+      if (panelFlick) panelFlick.contentY = 0
+      wireguard.refresh()
+      Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    }
+  }
+  onConfigIndexChanged: scrollCursorIntoView()
+
+  Service {
+    id: wireguard
+    settings: root.settings
+  }
+
+  Connections {
+    target: wireguard
+    function onConfigsChanged() { root.ensureCursor() }
+    // The picker runs whether or not the popup is open (bar right-click,
+    // IPC); open the popup so the name prompt has somewhere to appear.
+    function onImportReady(kind, payload, suggestedName) {
+      if (!root.opened) root.open()
+      root.beginImport(kind, payload, suggestedName)
+    }
+  }
+
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): string { wireguard.refresh(); return "ok" }
+    function down(): string { wireguard.disconnectAll(); return "ok" }
+    function status(): string { return wireguard.statusText }
+    // Headless import — no prompt, the name is derived from the filename.
+    // (`import` is a JS keyword, hence the longer name.)
+    function importConfig(path: string): string {
+      var name = wireguard.sanitizeName(path)
+      if (!wireguard.isValidName(name)) return "error: cannot derive an interface name from " + path
+      wireguard.importFile(path, name)
+      return name
+    }
+    function edit(name: string): string {
+      if (wireguard.configs.indexOf(name) === -1) return "error: no such config: " + name
+      wireguard.editConfig(name, "")
+      return "ok"
+    }
+    function importPick(): string { wireguard.pickConfigFile(); return "ok" }
+    function importPaste(): string { wireguard.pasteConfig(); return "ok" }
+  }
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: "󰖂"
+    foreground: root.barIconColor
+    tooltipText: wireguard.statusText
+    onPressed: function(buttonCode) {
+      if (buttonCode === Qt.RightButton) {
+        if (wireguard.active) wireguard.disconnectAll()
+        else root.open()
+      } else if (buttonCode === Qt.MiddleButton) {
+        wireguard.refresh()
+      } else {
+        root.toggle()
+      }
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(340))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(480))
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: root.pendingDelete !== "" || root.importPrompt
+      onMoveRequested: function(dx, dy) {
+        if (!root.cursorActive) { root.cursorActive = true; return }
+        root.moveCursor(dx, dy)
+      }
+      onActivateRequested: if (root.cursorActive) root.activateCursor()
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onDeleteRequested: {
+        if (root.cursorActive && root.focusSection === "configs") root.requestDelete(root.selectedConfig())
+      }
+      onTextKey: function(t) {
+        if (t === "t" || t === "T") wireguard.toggle()
+        else if (t === "r" || t === "R") wireguard.refresh()
+        else if (t === "d" || t === "D") wireguard.disconnectAll()
+        else if (t === "i" || t === "I") wireguard.pickConfigFile()
+        else if (t === "v" || t === "V") wireguard.pasteConfig()
+        else if (t === "e" || t === "E") {
+          if (root.cursorActive && root.focusSection === "configs") wireguard.editConfig(root.selectedConfig(), "")
+        }
+      }
+
+      Flickable {
+        id: panelFlick
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        Column {
+          id: column
+          width: panelFlick.width
+          spacing: Style.space(12)
+
+          Item {
+            id: header
+            width: parent.width
+            implicitHeight: hero.implicitHeight
+            // Exposed for the hero's trailingControl, whose `root` resolves to
+            // PanelHero (not this Panel) — reach panel state via `header`.
+            readonly property bool ringVisible: root.headerHasCursor
+            function focusHero() { root.setHeaderCursor() }
+
+            PanelHero {
+              id: hero
+              width: parent.width
+              title: "WireGuard"
+              meta: wireguard.active ? "Connected: " + wireguard.activeInterfaces.join(", ") : "Disconnected"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              iconOpacity: wireguard.active ? 1.0 : 0.5
+              iconComponent: Component {
+                Text {
+                  text: "󰖂"
+                  color: root.iconColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.display
+                }
+              }
+
+              trailingControl: Component {
+                ToggleSwitch {
+                  id: powerSwitch
+                  visible: wireguard.configs.length > 0
+                  checked: wireguard.active
+                  busy: wireguard.busy
+                  hasCursor: header.ringVisible
+                  foreground: hero.foreground
+                  onHovered: function(on) { if (on) header.focusHero() }
+                  onToggled: wireguard.toggle()
+
+                  PanelToolTip {
+                    visible: powerSwitch.containsMouse
+                    text: root.toggleHint
+                    fontFamily: hero.fontFamily
+                  }
+                }
+              }
+            }
+          }
+
+          Text {
+            visible: wireguard.actionStatus !== "" || wireguard.lastError !== ""
+            width: parent.width
+            text: wireguard.actionStatus !== "" ? wireguard.actionStatus : wireguard.lastError
+            color: wireguard.lastError !== "" && wireguard.actionStatus === "" ? root.urgent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(10)
+
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(sectionLabel.implicitHeight, importActions.implicitHeight)
+
+              PanelSectionHeader {
+                id: sectionLabel
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "CONFIGS"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Row {
+                id: importActions
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                PanelActionButton {
+                  iconText: "󰐕"
+                  tooltipText: "Import a .conf file (i)"
+                  foreground: root.dim
+                  hoverColor: root.foreground
+                  fontFamily: root.fontFamily
+                  enabled: !wireguard.busy
+                  onClicked: wireguard.pickConfigFile()
+                }
+
+                PanelActionButton {
+                  iconText: "󰅌"
+                  tooltipText: "Import from clipboard (v)"
+                  foreground: root.dim
+                  hoverColor: root.foreground
+                  fontFamily: root.fontFamily
+                  enabled: !wireguard.busy
+                  onClicked: wireguard.pasteConfig()
+                }
+              }
+            }
+
+            Text {
+              visible: wireguard.configs.length === 0
+              width: parent.width
+              text: "No .conf files in " + wireguard.configsDir + "\nImport one with + or paste it with v"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WrapAnywhere
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Column {
+              id: configColumn
+              visible: wireguard.configs.length > 0
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: wireguard.configs
+                ConfigRow {
+                  required property var modelData
+                  required property int index
+                  width: configColumn.width
+                  configName: String(modelData)
+                  rowIndex: index
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Name prompt for an incoming config, shared by both import paths.
+      // wg-quick derives the interface name from the filename, so the name
+      // is the one thing neither a picked file nor pasted text can supply
+      // reliably — and it doubles as the replace-or-not decision.
+      Item {
+        id: importDialog
+        anchors.fill: parent
+        visible: root.importPrompt
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(Color.background, 0.7)
+
+          MouseArea { anchors.fill: parent; onClicked: root.cancelImport() }
+
+          BorderSurface {
+            id: importCard
+            width: Math.min(parent.width - Style.space(32), Style.space(340))
+            height: importCard.contentTopInset + importCard.contentBottomInset + importColumn.implicitHeight
+            anchors.centerIn: parent
+            color: Color.background
+            borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
+            padding: Style.space(18)
+            radius: Style.cornerRadius
+
+            MouseArea { anchors.fill: parent; onClicked: {} }
+
+            Column {
+              id: importColumn
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.topMargin: importCard.contentTopInset
+              anchors.leftMargin: importCard.contentLeftInset
+              anchors.rightMargin: importCard.contentRightInset
+              spacing: Style.space(10)
+
+              Text {
+                width: parent.width
+                text: root.importSourceLabel
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                elide: Text.ElideMiddle
+              }
+
+              TextField {
+                id: nameField
+                width: parent.width
+                placeholderText: "Interface name"
+                foreground: root.foreground
+                font.family: root.fontFamily
+                text: root.importName
+
+                onTextChanged: if (text !== root.importName) root.importName = text
+                onAccepted: root.confirmImport()
+                Keys.onEscapePressed: root.cancelImport()
+              }
+
+              Text {
+                width: parent.width
+                text: root.importHintText
+                color: root.importNameValid ? root.dim : root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WrapAnywhere
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: importButtons.implicitHeight
+
+                Row {
+                  id: importButtons
+                  anchors.right: parent.right
+                  spacing: Style.space(10)
+
+                  Button {
+                    text: "Cancel"
+                    bordered: true
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    onClicked: root.cancelImport()
+                  }
+
+                  Button {
+                    text: root.importReplaces ? "Replace" : "Import"
+                    bordered: true
+                    enabled: root.importNameValid
+                    foreground: root.importNameValid ? root.foreground : root.dim
+                    fontFamily: root.fontFamily
+                    onClicked: root.confirmImport()
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        onVisibleChanged: {
+          if (visible) {
+            Qt.callLater(function() {
+              nameField.forceActiveFocus()
+              nameField.selectAll()
+            })
+          } else {
+            keyCatcher.forceActiveFocus()
+          }
+        }
+      }
+
+      ConfirmDialog {
+        id: deleteDialog
+        anchors.fill: parent
+        opened: root.pendingDelete !== ""
+        message: "Delete " + root.pendingDelete + ".conf?"
+        confirmText: "Delete"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        Keys.onPressed: function(event) { event.accepted = deleteDialog.handleKey(event) }
+        onOpenedChanged: {
+          if (opened) {
+            selectedIndex = 0
+            forceActiveFocus()
+          } else {
+            keyCatcher.forceActiveFocus()
+          }
+        }
+        onCanceled: root.pendingDelete = ""
+        onConfirmed: {
+          var name = root.pendingDelete
+          root.pendingDelete = ""
+          wireguard.deleteConfig(name)
+        }
+      }
+    }
+  }
+
+  component ConfigRow: CursorSurface {
+    id: configRow
+    property string configName: ""
+    property int rowIndex: 0
+    readonly property bool connected: wireguard.isActive(configName)
+
+    hasCursor: root.cursorActive && root.focusSection === "configs" && root.configIndex === rowIndex
+    current: connected
+    foreground: root.foreground
+
+    implicitHeight: rowContent.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: wireguard.busy ? Qt.ArrowCursor : Qt.PointingHandCursor
+      onEntered: root.setConfigCursor(configRow.rowIndex)
+      onClicked: root.activateConfig(configRow.configName)
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(8)
+
+      Text {
+        text: configRow.connected ? "󰄬" : "󰌘"
+        color: configRow.connected ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      ColumnLayout {
+        id: rowContent
+        Layout.fillWidth: true
+        spacing: Style.space(1)
+
+        Text {
+          Layout.fillWidth: true
+          text: configRow.configName
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          elide: Text.ElideRight
+        }
+
+        Text {
+          Layout.fillWidth: true
+          text: configRow.connected ? "Connected — click to disconnect" : "Click to connect"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      PanelActionButton {
+        iconText: "󰏫"
+        tooltipText: "Edit config"
+        foreground: root.dim
+        hoverColor: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !wireguard.busy
+        visible: configRow.hasCursor
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: wireguard.editConfig(configRow.configName, "")
+      }
+
+      PanelActionButton {
+        iconText: "󰆴"
+        tooltipText: "Delete config"
+        foreground: root.dim
+        hoverColor: root.urgent
+        fontFamily: root.fontFamily
+        enabled: !wireguard.busy
+        visible: configRow.hasCursor
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: root.requestDelete(configRow.configName)
+      }
+    }
+  }
+}
