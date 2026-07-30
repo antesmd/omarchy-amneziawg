@@ -3,7 +3,7 @@
   "id": "glafeara.wireguard",
   "name": "WireGuard",
   "version": "1.1.0",
-  "author": "say10",
+  "author": "glafeara",
   "license": "MIT",
   "description": "WireGuard status, config import, config switching, and quick toggle in the Omarchy bar.",
   "kinds": [
