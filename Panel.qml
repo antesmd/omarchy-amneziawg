@@ -217,6 +217,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
+    // The vpn glyph, not the mark: at the bar's 13px the dragon loses its
+    // head. The real logo lives in the panel header, where it has room.
     text: "󰖂"
     foreground: root.barIconColor
     tooltipText: wireguard.statusText
@@ -300,12 +302,13 @@ Panel {
               foreground: root.foreground
               fontFamily: root.fontFamily
               iconOpacity: wireguard.active ? 1.0 : 0.5
+              // The real mark rather than a glyph: at display size the
+              // dragon actually reads. The bar keeps the vpn glyph, where
+              // 13px would reduce this to a blob.
               iconComponent: Component {
-                Text {
-                  text: "󰖂"
+                WireGuardIcon {
+                  iconSize: Style.font.display
                   color: root.iconColor
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.display
                 }
               }
 
