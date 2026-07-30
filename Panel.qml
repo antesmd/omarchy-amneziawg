@@ -36,15 +36,22 @@ Panel {
   readonly property bool importPrompt: importKind !== ""
   readonly property string importNameClean: importName.trim()
   readonly property bool importNameValid: wireguard.isValidName(importNameClean)
-  readonly property bool importReplaces: importNameValid && wireguard.findByName(importNameClean) !== null
+  readonly property int importNameCount: importNameValid ? wireguard.countByName(importNameClean) : 0
+  readonly property bool importReplaces: importNameCount === 1
+  // Several existing profiles share the typed name — "replace" cannot know
+  // which one is meant, so the import is refused under this name.
+  readonly property bool importAmbiguous: importNameCount > 1
+  readonly property bool importAccepted: importNameValid && !importAmbiguous
   readonly property string importSourceLabel: importKind === "text"
     ? "Import from clipboard"
     : "Import " + String(importPayload).split("/").pop()
   readonly property string importHintText: !importNameValid
     ? "Up to 15 characters: letters, digits and . _ - = +"
-    : (importReplaces
-      ? "Replaces the existing connection " + importNameClean
-      : "Imports as NetworkManager connection " + importNameClean)
+    : (importAmbiguous
+      ? importNameCount + " profiles share the name " + importNameClean + " — pick another name"
+      : (importReplaces
+        ? "Replaces the existing connection " + importNameClean
+        : "Imports as NetworkManager connection " + importNameClean))
 
   function ensureCursor() {
     if (wireguard.profiles.length === 0) {
@@ -129,7 +136,7 @@ Panel {
   }
 
   function confirmImport() {
-    if (!importNameValid) return
+    if (!importAccepted) return
     var kind = importKind
     var payload = importPayload
     var name = importNameClean
@@ -206,12 +213,20 @@ Panel {
     function importConfig(path: string): string {
       var name = wireguard.sanitizeName(path)
       if (!wireguard.isValidName(name)) return "error: cannot derive an interface name from " + path
+      if (wireguard.countByName(name) > 1) return "error: ambiguous name: several profiles are named " + name
       wireguard.importFile(path, name)
       return name
     }
-    function edit(name: string): string {
-      var profile = wireguard.findByName(name)
-      if (!profile) return "error: no such config: " + name
+    // Takes a connection name or a profile UUID; a name shared by several
+    // profiles is refused rather than resolved to an arbitrary one.
+    function edit(target: string): string {
+      var profile = wireguard.findByUuid(target)
+      if (!profile) {
+        var n = wireguard.countByName(target)
+        if (n === 0) return "error: no such config: " + target
+        if (n > 1) return "error: ambiguous name: " + target + " — use a UUID: " + wireguard.uuidsForName(target).join(" ")
+        profile = wireguard.findByName(target)
+      }
       wireguard.editConfig(profile, "")
       return "ok"
     }
@@ -496,7 +511,7 @@ Panel {
               Text {
                 width: parent.width
                 text: root.importHintText
-                color: root.importNameValid ? root.dim : root.urgent
+                color: root.importAccepted ? root.dim : root.urgent
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WrapAnywhere
@@ -522,8 +537,8 @@ Panel {
                   Button {
                     text: root.importReplaces ? "Replace" : "Import"
                     bordered: true
-                    enabled: root.importNameValid
-                    foreground: root.importNameValid ? root.foreground : root.dim
+                    enabled: root.importAccepted
+                    foreground: root.importAccepted ? root.foreground : root.dim
                     fontFamily: root.fontFamily
                     onClicked: root.confirmImport()
                   }

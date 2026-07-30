@@ -72,14 +72,41 @@ Item {
   }
 
   // First profile with this name, or null. Only for the name-based entry
-  // points (import replace, IPC) — with duplicate names this is a guess,
-  // and everything row-bound carries its own profile object instead.
+  // points (import replace, IPC), and only once countByName has ruled out
+  // duplicates — with several matches the first one is the wrong answer as
+  // often as the right one. Everything row-bound carries its own profile.
   function findByName(name) {
     var value = String(name || "")
     for (var i = 0; i < profiles.length; i++) {
       if (profiles[i].name === value) return profiles[i]
     }
     return null
+  }
+
+  function findByUuid(uuid) {
+    var value = String(uuid || "")
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].uuid === value) return profiles[i]
+    }
+    return null
+  }
+
+  function countByName(name) {
+    var value = String(name || "")
+    var n = 0
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].name === value) n++
+    }
+    return n
+  }
+
+  function uuidsForName(name) {
+    var value = String(name || "")
+    var out = []
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].name === value) out.push(profiles[i].uuid)
+    }
+    return out
   }
 
   function applyStatus(raw) {
@@ -223,8 +250,16 @@ Item {
     editRetryTimer.restart()
   }
 
+  // Refuses an ambiguous replace outright: with several profiles sharing
+  // the name, "replace the one that matched first" would silently destroy a
+  // profile the user never pointed at. The panel blocks this earlier with a
+  // clearer message; this is the backstop for the headless entry points.
   function importFile(path, name) {
     if (busy || !path || !name) return
+    if (countByName(name) > 1) {
+      lastError = "Several profiles are named " + name + " — not replacing an ambiguous match"
+      return
+    }
     var existing = findByName(name)
     actionStatus = "Importing " + name + "…"
     runControl(["import", String(name), existing ? existing.uuid : "", String(path)])
@@ -253,6 +288,10 @@ Item {
 
   function importText(text, name) {
     if (busy || !text || !name) return
+    if (countByName(name) > 1) {
+      lastError = "Several profiles are named " + name + " — not replacing an ambiguous match"
+      return
+    }
     var existing = findByName(name)
     actionStatus = "Importing " + name + "…"
     runControl(["import", String(name), existing ? existing.uuid : ""], String(text))
