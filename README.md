@@ -62,9 +62,10 @@ from then on.
 
 ## Using it
 
-**In the bar:** left click toggles the last used tunnel (or opens the panel
-when there are no connections yet), right click opens the panel (or
-disconnects if a tunnel is up), middle click refreshes.
+**In the bar:** left click opens and closes the panel, right click
+disconnects the active tunnel (or opens the panel when nothing is up),
+middle click refreshes. The quick VPN toggle is the switch in the panel
+header, the `t` key, or the IPC `toggle` command.
 
 **In the panel:**
 

@@ -231,10 +231,9 @@ Panel {
       } else if (buttonCode === Qt.MiddleButton) {
         wireguard.refresh()
       } else {
-        // Left click connects/disconnects the last used tunnel; with no
-        // configs yet there is nothing to toggle, so open the panel instead.
-        if (wireguard.toggleTarget !== "" || wireguard.active) wireguard.toggle()
-        else root.open()
+        // Left click opens/closes the panel — the VPN toggle lives on the
+        // hero switch, the `t` key, and the IPC `toggle` command.
+        root.toggle()
       }
     }
   }
