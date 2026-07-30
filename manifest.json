@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "glafeara.wireguard",
   "name": "WireGuard",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "author": "glafeara",
   "license": "MIT",
   "description": "WireGuard status, config import, config switching, and quick toggle in the Omarchy bar.",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "WireGuard",
-    "description": "Toggle WireGuard, import .conf files, and switch between configs from ~/.config/wireguard.",
+    "description": "Toggle WireGuard, import .conf files, and switch between NetworkManager WireGuard connections. No sudo required.",
     "category": "Network",
     "allowMultiple": false,
     "defaults": {

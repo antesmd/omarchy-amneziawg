@@ -4,25 +4,24 @@ Connect, switch, import and edit WireGuard tunnels from the Omarchy bar.
 
 ![The WireGuard panel](preview.png)
 
-Configs live in `~/.config/wireguard/` and the widget names each interface
-after its file, exactly the way `wg-quick` does. Switching is exclusive: the
-tunnel you pick comes up and everything else goes down.
+Tunnels are NetworkManager connection profiles. The widget lists every
+WireGuard profile NetworkManager knows about, and importing a `.conf` file
+creates one. Switching is exclusive: the tunnel you pick comes up and every
+other WireGuard tunnel goes down. Non-WireGuard connections (wifi, ethernet,
+tailscale) are never touched.
+
+**No sudo, no root shell.** Everything goes through NetworkManager over
+D-Bus, authorized by polkit — on a stock Omarchy desktop an active local
+session controls networking without a password, so the widget needs no
+sudoers rules and never prompts. Unlike `wg-quick`, NetworkManager does not
+execute `PreUp`/`PostUp`/`PreDown`/`PostDown` shell hooks, so a config file
+is data, not code: importing a malicious config cannot run commands. Configs
+containing hook directives are rejected with a clear message.
 
 ## Requirements
 
-- **`wireguard-tools`** — `wg` and `wg-quick`. Required.
-- **Passwordless `wg-quick`.** Bringing a tunnel up needs root, and the widget
-  never prompts. Grant exactly two commands and nothing else:
-
-  ```bash
-  echo "$USER ALL=(ALL:ALL) NOPASSWD: /usr/bin/wg, /usr/bin/wg-quick" |
-    sudo tee /etc/sudoers.d/wireguard-omarchy
-  sudo chmod 440 /etc/sudoers.d/wireguard-omarchy
-  ```
-
-  This plugin does not write that file for you — read the line, decide, then
-  run it yourself. Without it the widget still lists configs and reports
-  status, but connecting fails with a sudo error.
+- **NetworkManager** — running (Omarchy default).
+- **`wireguard-tools`** — only `wg` is used, to validate keys before import.
 - **`zenity`** — optional, for the file picker and the config editor.
   `kdialog` or `yad` also work for the file picker.
 - **`wl-clipboard`** — optional, for importing a config from the clipboard.
@@ -36,45 +35,73 @@ omarchy bar plugin add glafeara.wireguard right
 ```
 
 Plugins land disabled so you can read the code before enabling it — this one
-is two QML files. Add `--yes` to any of the commands to skip the prompts.
+is three QML files and one shell script. Add `--yes` to any of the commands
+to skip the prompts.
+
+## Migrating from 1.x
+
+Version 1.x drove `wg-quick` via a sudoers rule and kept configs in
+`~/.config/wireguard/`. To migrate:
+
+1. Import each config through the panel (`i`, or
+   `omarchy-shell glafeara.wireguard importConfig ~/.config/wireguard/kz.conf`).
+2. Delete the old sudoers rule — it granted passwordless root and nothing
+   needs it anymore:
+
+   ```bash
+   sudo rm -f /etc/sudoers.d/wireguard-omarchy
+   ```
+
+3. Optionally delete `~/.config/wireguard/*.conf` — after import the
+   private keys live in NetworkManager's root-owned storage, so the copies
+   in your home directory are just leftover secrets.
+
+Tunnels brought up manually with `wg-quick up` are invisible to
+NetworkManager and to this widget; bring them down once and use the widget
+from then on.
 
 ## Using it
 
-**In the bar:** left click toggles the last used tunnel, right click opens the
-panel (or disconnects if a tunnel is up), middle click refreshes.
+**In the bar:** left click toggles the last used tunnel (or opens the panel
+when there are no connections yet), right click opens the panel (or
+disconnects if a tunnel is up), middle click refreshes.
 
 **In the panel:**
 
 | Key | Action |
 | --- | --- |
 | `j` / `k`, arrows | move the cursor |
-| `Enter`, `Space` | connect or disconnect the selected config |
+| `Enter`, `Space` | connect or disconnect the selected connection |
 | `t` | toggle the last used tunnel |
 | `i` | import a `.conf` file |
 | `v` | import a config from the clipboard |
-| `e` | edit the selected config |
-| `x` | delete the selected config (asks first) |
+| `e` | edit the selected connection |
+| `x` | delete the selected connection (asks first) |
 | `r` | refresh |
 | `d` | disconnect everything |
 | `Esc` | close |
 
-**Importing** asks for a name, because `wg-quick` takes the interface name
-from the filename and the kernel only accepts up to 15 characters of
-`[A-Za-z0-9_=+.-]` — provider files like `US-New York 03.conf` do not
-qualify. The name doubles as the replace-or-not decision.
+**Importing** asks for a name, because the interface is named after it and
+the kernel only accepts up to 15 characters of `[A-Za-z0-9_=+.-]` — provider
+files like `US-New York 03.conf` do not qualify. The name doubles as the
+replace-or-not decision. Imported profiles never auto-connect; a tunnel
+comes up only when you say so.
 
-**Editing** opens the config in zenity's text view. Saving unchanged text
-leaves the file alone; saving over a running tunnel rewrites the config and
-brings the tunnel back up on it. Text rejected by validation is handed back to
-the editor rather than thrown away.
+**Editing** shows the connection as wg-quick-style text in zenity's text
+view — reconstructed from NetworkManager, secrets included. Saving unchanged
+text does nothing; saving over a running tunnel rebuilds the profile and
+brings the tunnel back up on it. Text rejected by validation is handed back
+to the editor rather than thrown away.
 
-**Validation.** Every incoming config — file, clipboard or edit — must have an
-`[Interface]` section, a `PrivateKey`, and keys that `wg pubkey` accepts. That
-catches the truncated base64 copy-paste produces, which `wg-quick` would
-otherwise only complain about at connect time. Addresses, endpoints and
-unknown directives are left to `wg-quick`. Checks run *before* anything is
-written, so a rejected import costs you neither the file you had nor the
-tunnel you were on.
+**Validation.** Every incoming config — file, clipboard or edit — is parsed
+key by key. Keys must pass `wg pubkey`, which catches the truncated base64
+copy-paste produces. Supported: `Address`, `DNS`, `ListenPort`, `MTU`,
+`FwMark`, `Table`, and per peer `PublicKey`, `PresharedKey`, `AllowedIPs`,
+`Endpoint`, `PersistentKeepalive`. Hook directives and unknown keys are
+rejected outright — with this backend they would never run, and silently
+dropping them would lie about what the tunnel does. A rejected import
+changes nothing: the profile you had and the tunnel you were on stay as
+they were.
 
 ## Settings
 
@@ -90,7 +117,7 @@ omarchy bar plugin set glafeara.wireguard refreshIntervalSec 30
 
 ```bash
 omarchy-shell glafeara.wireguard status                  # "VPN: kz" / "VPN disconnected"
-omarchy-shell glafeara.wireguard toggle
+omarchy-shell glafeara.wireguard toggle                  # connect/disconnect the last used tunnel
 omarchy-shell glafeara.wireguard down                    # disconnect everything
 omarchy-shell glafeara.wireguard refresh
 omarchy-shell glafeara.wireguard open                    # also: close, show, hide
@@ -102,15 +129,16 @@ omarchy-shell glafeara.wireguard importPaste             # imports from the clip
 
 ## What it touches
 
-- `~/.config/wireguard/*.conf` — reads them, and writes one when you import or
-  edit. Writes go through a temp file in the same directory and land with mode
-  `600`. Deletes only what you explicitly delete.
+- **NetworkManager connection profiles** of type `wireguard` — lists them,
+  activates and deactivates them, creates one per import, deletes only what
+  you explicitly delete. Secrets live in NetworkManager's own root-owned
+  storage under `/etc/NetworkManager/system-connections/`.
 - `~/.local/state/omarchy/wireguard-last` — the name of the last tunnel you
   connected, so the bar's quick toggle reconnects what you actually used.
-- `sudo -n wg-quick up|down` — nothing else runs as root, and the plugin never
-  edits sudoers.
 
-Nothing outside those paths, no install or uninstall scripts, no services, no
+Everything runs as your user; authorization is NetworkManager's stock
+polkit policy. Private keys are passed to `nmcli` on stdin, never as
+command-line arguments. No install or uninstall scripts, no services, no
 network calls of its own.
 
 ## Uninstall
@@ -120,13 +148,12 @@ omarchy bar plugin remove glafeara.wireguard
 omarchy plugin remove glafeara.wireguard
 ```
 
-That disables the widget and deletes the plugin directory. Your tunnels in
-`~/.config/wireguard/` are left alone — they are yours and predate the plugin.
-Two leftovers to clean up by hand if you want them gone:
+That disables the widget and deletes the plugin directory. Your tunnels stay
+in NetworkManager — remove them with `nmcli connection delete <name>` if you
+want them gone, and:
 
 ```bash
 rm -f ~/.local/state/omarchy/wireguard-last
-sudo rm -f /etc/sudoers.d/wireguard-omarchy   # only if nothing else needs it
 ```
 
 ## License

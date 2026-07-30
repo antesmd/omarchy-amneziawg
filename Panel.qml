@@ -42,8 +42,8 @@ Panel {
   readonly property string importHintText: !importNameValid
     ? "Up to 15 characters: letters, digits and . _ - = +"
     : (importReplaces
-      ? "Replaces the existing " + importNameClean + ".conf"
-      : "Saves as " + wireguard.configsDir + "/" + importNameClean + ".conf")
+      ? "Replaces the existing connection " + importNameClean
+      : "Imports as NetworkManager connection " + importNameClean)
 
   function ensureCursor() {
     if (wireguard.configs.length === 0) {
@@ -192,7 +192,9 @@ Panel {
     function close(): void { root.close() }
     function show(): void { root.open() }
     function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
+    // VPN toggle, not panel visibility — open/close/show/hide already cover
+    // the popup, and the bar's left click promises the same thing.
+    function toggle(): void { wireguard.toggle() }
     function refresh(): string { wireguard.refresh(); return "ok" }
     function down(): string { wireguard.disconnectAll(); return "ok" }
     function status(): string { return wireguard.statusText }
@@ -229,7 +231,10 @@ Panel {
       } else if (buttonCode === Qt.MiddleButton) {
         wireguard.refresh()
       } else {
-        root.toggle()
+        // Left click connects/disconnects the last used tunnel; with no
+        // configs yet there is nothing to toggle, so open the panel instead.
+        if (wireguard.toggleTarget !== "" || wireguard.active) wireguard.toggle()
+        else root.open()
       }
     }
   }
@@ -298,7 +303,7 @@ Panel {
               id: hero
               width: parent.width
               title: "WireGuard"
-              meta: wireguard.active ? "Connected: " + wireguard.activeInterfaces.join(", ") : "Disconnected"
+              meta: wireguard.active ? "Connected: " + wireguard.activeConnections.join(", ") : "Disconnected"
               foreground: root.foreground
               fontFamily: root.fontFamily
               iconOpacity: wireguard.active ? 1.0 : 0.5
@@ -395,7 +400,7 @@ Panel {
             Text {
               visible: wireguard.configs.length === 0
               width: parent.width
-              text: "No .conf files in " + wireguard.configsDir + "\nImport one with + or paste it with v"
+              text: "No WireGuard connections in NetworkManager\nImport a .conf with + or paste one with v"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -425,7 +430,7 @@ Panel {
       }
 
       // Name prompt for an incoming config, shared by both import paths.
-      // wg-quick derives the interface name from the filename, so the name
+      // The interface name is derived from the filename, so the name
       // is the one thing neither a picked file nor pasted text can supply
       // reliably — and it doubles as the replace-or-not decision.
       Item {
@@ -539,7 +544,7 @@ Panel {
         id: deleteDialog
         anchors.fill: parent
         opened: root.pendingDelete !== ""
-        message: "Delete " + root.pendingDelete + ".conf?"
+        message: "Delete connection " + root.pendingDelete + "?"
         confirmText: "Delete"
         foreground: root.foreground
         fontFamily: root.fontFamily
