@@ -15,14 +15,20 @@ Item {
   readonly property string lastFile: stateDir + "/wireguard-last"
   readonly property string backendPath: String(Qt.resolvedUrl("backend.sh")).replace(/^file:\/\//, "")
 
-  // Connection names of NetworkManager's wireguard profiles, sorted
-  property var configs: []
-  // name -> profile UUID; all control operations address profiles by UUID
-  // because NetworkManager permits duplicate names
-  property var uuidByName: ({})
+  // NetworkManager's wireguard profiles as {uuid, name, active}, sorted by
+  // name. Every control operation addresses a profile by UUID, because
+  // NetworkManager permits duplicate names — a name is a label here, never
+  // an address.
+  property var profiles: []
   // Names of the wireguard profiles currently active
-  property var activeConnections: []
-  readonly property bool active: activeConnections.length > 0
+  readonly property var activeNames: {
+    var out = []
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].active) out.push(profiles[i].name)
+    }
+    return out
+  }
+  readonly property bool active: activeNames.length > 0
   // Most recently connected config, persisted across restarts so the
   // hero toggle reconnects what you actually used last.
   property string lastConnected: ""
@@ -30,10 +36,15 @@ Item {
   property string lastError: ""
 
   readonly property bool busy: controlProcess.running
-  readonly property string statusText: active ? "VPN: " + activeConnections.join(" ") : "VPN disconnected"
+  readonly property string statusText: active ? "VPN: " + activeNames.join(" ") : "VPN disconnected"
   // What toggle() would bring up: last used config if it still exists,
   // otherwise the first one.
-  readonly property string toggleTarget: configs.indexOf(lastConnected) !== -1 ? lastConnected : (configs.length > 0 ? configs[0] : "")
+  readonly property string toggleTarget: {
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].name === lastConnected) return lastConnected
+    }
+    return profiles.length > 0 ? profiles[0].name : ""
+  }
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 10, 2, 3600)
 
@@ -54,8 +65,15 @@ Item {
     if (!statusProcess.running) statusProcess.running = true
   }
 
-  function isActive(name) {
-    return activeConnections.indexOf(String(name)) !== -1
+  // First profile with this name, or null. Only for the name-based entry
+  // points (import replace, IPC) — with duplicate names this is a guess,
+  // and everything row-bound carries its own profile object instead.
+  function findByName(name) {
+    var value = String(name || "")
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].name === value) return profiles[i]
+    }
+    return null
   }
 
   function applyStatus(raw) {
@@ -65,8 +83,7 @@ Item {
       lastError = "Failed to read WireGuard status"
       return
     }
-    var names = []
-    var byName = {}
+    var list = []
     var byUuid = {}
     for (var i = 0; i < sep; i++) {
       // uuid:name:type — the UUID contains no colons and the type is the
@@ -77,22 +94,25 @@ Item {
       var last = line.lastIndexOf(":")
       if (first === -1 || last <= first) continue
       if (line.slice(last + 1) !== "wireguard") continue
-      var name = line.slice(first + 1, last).replace(/\\:/g, ":").replace(/\\\\/g, "\\")
-      names.push(name)
-      byName[name] = line.slice(0, first)
-      byUuid[line.slice(0, first)] = name
+      var entry = {
+        uuid: line.slice(0, first),
+        name: line.slice(first + 1, last).replace(/\\:/g, ":").replace(/\\\\/g, "\\"),
+        active: false
+      }
+      list.push(entry)
+      byUuid[entry.uuid] = entry
     }
-    names.sort()
-    var up = []
+    list.sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0) })
+    var firstUp = ""
     for (var j = sep + 1; j < lines.length; j++) {
       var uuid = lines[j].trim()
-      if (uuid !== "" && byUuid[uuid] !== undefined) up.push(byUuid[uuid])
+      if (uuid === "" || byUuid[uuid] === undefined) continue
+      byUuid[uuid].active = true
+      if (firstUp === "") firstUp = byUuid[uuid].name
     }
-    configs = names
-    uuidByName = byName
-    activeConnections = up
+    profiles = list
     // Track connects made outside the widget too (nmcli, GUI).
-    if (up.length > 0) rememberLast(up[0])
+    if (firstUp !== "") rememberLast(firstUp)
     lastError = ""
   }
 
@@ -106,21 +126,17 @@ Item {
     saveProcess.running = true
   }
 
-  function connectTo(name) {
-    if (busy || !name) return
-    var uuid = uuidByName[String(name)]
-    if (!uuid) return
-    actionStatus = "Connecting " + name + "…"
-    _pendingConnect = String(name)
-    runControl(["connect", uuid])
+  function connectTo(profile) {
+    if (busy || !profile || !profile.uuid) return
+    actionStatus = "Connecting " + profile.name + "…"
+    _pendingConnect = String(profile.name)
+    runControl(["connect", profile.uuid])
   }
 
-  function disconnectOne(name) {
-    if (busy || !name) return
-    var uuid = uuidByName[String(name)]
-    if (!uuid) return
-    actionStatus = "Disconnecting " + name + "…"
-    runControl(["down", uuid])
+  function disconnectOne(profile) {
+    if (busy || !profile || !profile.uuid) return
+    actionStatus = "Disconnecting " + profile.name + "…"
+    runControl(["down", profile.uuid])
   }
 
   function disconnectAll() {
@@ -129,17 +145,15 @@ Item {
     runControl(["down-all"])
   }
 
-  function deleteConfig(name) {
-    if (busy || !name) return
-    var uuid = uuidByName[String(name)]
-    if (!uuid) return
-    actionStatus = "Deleting " + name + "…"
-    runControl(["delete", uuid])
+  function deleteConfig(profile) {
+    if (busy || !profile || !profile.uuid) return
+    actionStatus = "Deleting " + profile.name + "…"
+    runControl(["delete", profile.uuid])
   }
 
   function toggle() {
     if (active) disconnectAll()
-    else if (toggleTarget !== "") connectTo(toggleTarget)
+    else if (toggleTarget !== "") connectTo(findByName(toggleTarget))
   }
 
   // Import: a picked file or pasted text becomes an NM connection profile,
@@ -164,33 +178,33 @@ Item {
 
   // Opens the profile as wg-quick text in zenity's editable view (the
   // backend reconstructs the text from NetworkManager, secrets included).
-  // Saving goes back through importText, so an edit gets the same parsing
-  // and validation as an import — and a tunnel that was up when you
-  // started editing is brought back up on the new profile.
+  // Saving goes back through import, so an edit gets the same parsing and
+  // validation as an import. Whether the tunnel comes back up is the
+  // backend's call, made inside the replace transaction from what is active
+  // at that moment — not from a snapshot taken when the editor opened.
   // `seedText` reopens the editor on text that was rejected rather than on
   // what is stored, so a refused save costs a keystroke to fix instead of
   // the whole edit.
-  function editConfig(name, seedText) {
-    if (!name || editProcess.running) return
-    var uuid = uuidByName[String(name)]
-    if (!uuid) return
-    _editTarget = String(name)
-    _editWasActive = isActive(name)
+  function editConfig(profile, seedText) {
+    if (!profile || !profile.uuid || editProcess.running) return
+    _editUuid = String(profile.uuid)
+    _editName = String(profile.name)
     if (!seedText) lastError = ""
-    actionStatus = "Editing " + name + "…"
+    actionStatus = "Editing " + _editName + "…"
     // The seed goes over stdin — it is config text with a private key in it,
     // and argv is world-readable via /proc.
     _editSeed = String(seedText || "")
     editProcess.stdinEnabled = true
-    editProcess.command = ["bash", backendPath, "edit", uuid, String(name)]
+    editProcess.command = ["bash", backendPath, "edit", _editUuid, _editName]
     editProcess.running = true
   }
 
   // Puts rejected text back in front of the user with the reason showing.
   // Deferred through a timer because the editor process that produced the
   // text is still winding down when the rejection lands.
-  function retryEdit(name, text, message) {
+  function retryEdit(uuid, name, text, message) {
     lastError = message
+    _editRetryUuid = String(uuid)
     _editRetryName = String(name)
     _editRetryText = String(text)
     editRetryTimer.restart()
@@ -198,8 +212,9 @@ Item {
 
   function importFile(path, name) {
     if (busy || !path || !name) return
+    var existing = findByName(name)
     actionStatus = "Importing " + name + "…"
-    runControl(["import", String(name), uuidByName[String(name)] || "", String(path)])
+    runControl(["import", String(name), existing ? existing.uuid : "", String(path)])
   }
 
   // Writes a queued editor save once controlProcess is free. Bypasses
@@ -207,25 +222,27 @@ Item {
   // the user has already committed the edit, so it either writes now or
   // stays queued — it never just disappears.
   function _flushPendingSave() {
-    if (_pendingSaveName === "" || busy) return
+    if (_pendingSaveUuid === "" || busy) return
+    var uuid = _pendingSaveUuid
     var name = _pendingSaveName
     var text = _pendingSaveText
+    _pendingSaveUuid = ""
     _pendingSaveName = ""
     _pendingSaveText = ""
-    if (_pendingSaveReconnect) _reconnectAfter = name
-    _pendingSaveReconnect = false
     // Held so a rejected save can be handed back to the editor instead of
     // being thrown away.
+    _editRetryUuid = uuid
     _editRetryName = name
     _editRetryText = text
-    actionStatus = "Importing " + name + "…"
-    runControl(["import", name, uuidByName[name] || ""], text)
+    actionStatus = "Saving " + name + "…"
+    runControl(["import", name, uuid], text)
   }
 
   function importText(text, name) {
     if (busy || !text || !name) return
+    var existing = findByName(name)
     actionStatus = "Importing " + name + "…"
-    runControl(["import", String(name), uuidByName[String(name)] || ""], String(text))
+    runControl(["import", String(name), existing ? existing.uuid : ""], String(text))
   }
 
   // The connection (and interface) is named after the file, and the kernel
@@ -252,7 +269,7 @@ Item {
   // Pasted text carries no name of its own — offer the first free wgN.
   function suggestName() {
     for (var i = 0; i < 100; i++) {
-      if (configs.indexOf("wg" + i) === -1) return "wg" + i
+      if (!findByName("wg" + i)) return "wg" + i
     }
     return "wg"
   }
@@ -298,21 +315,20 @@ Item {
   property string _controlError: ""
   property string _controlStdin: ""
   property string _pendingConnect: ""
-  property string _editTarget: ""
-  property bool _editWasActive: false
+  property string _editUuid: ""
+  property string _editName: ""
   property string _editSeed: ""
   // Edited text waiting for controlProcess to free up. The editor can close
   // while another operation runs (busy only gates controlProcess); a save
   // must queue, not silently vanish.
+  property string _pendingSaveUuid: ""
   property string _pendingSaveName: ""
   property string _pendingSaveText: ""
-  property bool _pendingSaveReconnect: false
   // Last edited text and its config, kept only until the write is known to
   // have succeeded.
+  property string _editRetryUuid: ""
   property string _editRetryName: ""
   property string _editRetryText: ""
-  // Config to bring back up once the current control run finishes.
-  property string _reconnectAfter: ""
 
   FileView {
     path: root.lastFile
@@ -334,11 +350,13 @@ Item {
         editRetryTimer.restart()
         return
       }
+      var uuid = root._editRetryUuid
       var name = root._editRetryName
       var text = root._editRetryText
+      root._editRetryUuid = ""
       root._editRetryName = ""
       root._editRetryText = ""
-      root.editConfig(name, text)
+      root.editConfig({ uuid: uuid, name: name }, text)
     }
   }
 
@@ -358,8 +376,15 @@ Item {
       id: statusStdout
       waitForEnd: true
     }
+    stderr: StdioCollector {
+      id: statusStderr
+      waitForEnd: true
+    }
     onExited: function(exitCode) {
+      // A failed poll must not read as "disconnected" — keep the last known
+      // state and say why it could not be refreshed.
       if (exitCode === 0) root.applyStatus(statusStdout.text)
+      else root.lastError = root.elide(statusStderr.text || "Failed to read WireGuard status")
     }
   }
 
@@ -401,10 +426,10 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
-      var target = root._editTarget
-      var wasActive = root._editWasActive
-      root._editTarget = ""
-      root._editWasActive = false
+      var uuid = root._editUuid
+      var name = root._editName
+      root._editUuid = ""
+      root._editName = ""
       root.actionStatus = ""
       if (exitCode === 2) {
         root.lastError = "zenity is not installed"
@@ -412,21 +437,21 @@ Item {
       }
       // 3 = Cancel, 4 = nothing changed; neither is worth a message.
       if (exitCode !== 0) {
-        if (exitCode !== 3 && exitCode !== 4) root.lastError = "Could not open " + target
+        if (exitCode !== 3 && exitCode !== 4) root.lastError = "Could not open " + name
         return
       }
       var text = String(editStdout.text || "")
       if (!root.looksLikeConfig(text)) {
-        root.retryEdit(target, text, "Not saved: that is not a WireGuard config")
+        root.retryEdit(uuid, name, text, "Not saved: that is not a WireGuard config")
         return
       }
       // Queued rather than written directly: busy only gates controlProcess,
       // so another operation may be mid-flight right now. The queue drains
       // from controlProcess.onExited — the save waits its turn instead of
       // being dropped.
-      root._pendingSaveName = target
+      root._pendingSaveUuid = uuid
+      root._pendingSaveName = name
       root._pendingSaveText = text
-      root._pendingSaveReconnect = wasActive
       Qt.callLater(root._flushPendingSave)
     }
   }
@@ -481,30 +506,21 @@ Item {
         if (root._pendingConnect !== "") root.rememberLast(root._pendingConnect)
         root.lastError = ""
         root.actionStatus = ""
+        root._editRetryUuid = ""
         root._editRetryName = ""
         root._editRetryText = ""
       } else {
         root.actionStatus = ""
-        root._reconnectAfter = ""
         var reason = root.elide(root._controlError || "NetworkManager operation failed")
         // A write refused by wg_check must not cost the edit that produced
         // it; hand the text back to the editor with the reason attached.
-        if (root._editRetryName !== "") root.retryEdit(root._editRetryName, root._editRetryText, reason)
+        if (root._editRetryName !== "") root.retryEdit(root._editRetryUuid, root._editRetryName, root._editRetryText, reason)
         else root.lastError = reason
       }
       root._pendingConnect = ""
       root.refresh()
-      // An edit of a live config took the tunnel down to rewrite the file;
-      // put it back on the new config. Deferred because runControl refuses
-      // to start while this process is still winding down.
-      if (root._reconnectAfter !== "") {
-        var target = root._reconnectAfter
-        root._reconnectAfter = ""
-        Qt.callLater(function() { root.connectTo(target) })
-      } else if (root._pendingSaveName !== "") {
-        // A save queued while this operation ran; write it now.
-        Qt.callLater(root._flushPendingSave)
-      }
+      // A save queued while this operation ran; write it now.
+      if (root._pendingSaveUuid !== "") Qt.callLater(root._flushPendingSave)
     }
   }
 }

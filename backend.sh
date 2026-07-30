@@ -14,6 +14,10 @@
 # Secrets (PrivateKey, PresharedKey) are fed to `nmcli connection edit` on
 # stdin, never passed as arguments — argv is world-readable in /proc.
 #
+# Mutating commands serialize on a per-user flock: the bar builds one widget
+# instance per monitor, so two connects can race each other into "exclusive"
+# tunnels that are anything but.
+#
 # Commands:
 #   status                      list connections + active wireguard UUIDs
 #   connect <uuid>              exclusive up: other wireguard profiles go down
@@ -21,11 +25,16 @@
 #   down-all                    deactivate every active wireguard profile
 #   delete <uuid>               delete a profile (deactivates it first)
 #   import <name> [old-uuid] [file]   build a profile from wg-quick config
-#                               text (stdin, or [file]); replaces [old-uuid]
+#                               text (stdin, or [file]); replaces [old-uuid],
+#                               keeping its connection.id and interface-name,
+#                               and reconnects if it was active
 #   export <uuid>               print the profile as wg-quick config text
 #   edit <uuid> <name>          zenity editor round-trip (seed text on stdin)
 
 set -u
+# A failing nmcli at the head of a pipeline must fail the pipeline — status
+# must never report "no tunnels" just because awk exited cleanly.
+set -o pipefail
 # No globbing: list values from configs are word-split on purpose, and a
 # value like "Address = *" must stay a literal asterisk, not a file list.
 set -f
@@ -34,6 +43,16 @@ export LC_ALL=C
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed"; }
+
+# One writer at a time, across every widget instance (one per monitor).
+# The fd stays open for the life of the process — including through the
+# `exec nmcli` tail calls — so the lock covers the whole operation.
+lock() {
+  need flock
+  local dir="${XDG_RUNTIME_DIR:-/tmp}"
+  exec 9>>"$dir/omarchy-wireguard.$(id -u).lock" || die "Cannot open the lock file"
+  flock -w 30 9 || die "Another WireGuard operation is already running"
+}
 
 valid_key() { printf '%s\n' "$1" | wg pubkey >/dev/null 2>&1; }
 
@@ -57,20 +76,21 @@ active_wg_uuids() {
 }
 
 cmd_status() {
-  nmcli -t -f UUID,NAME,TYPE connection show
+  nmcli -t -f UUID,NAME,TYPE connection show || exit 1
   echo ---
   active_wg_uuids
 }
 
 cmd_connect() {
-  local target="$1" u
+  local target="$1" active u
+  active="$(active_wg_uuids)" || die "Could not list active connections"
   # Switching is exclusive, but only among wireguard profiles — wifi,
   # tailscale and everything else NetworkManager runs is not ours to touch.
-  for u in $(active_wg_uuids); do
+  for u in $active; do
     [ "$u" = "$target" ] && continue
     nmcli connection down "$u" || exit 1
   done
-  for u in $(active_wg_uuids); do
+  for u in $active; do
     [ "$u" = "$target" ] && exit 0
   done
   exec nmcli connection up "$target"
@@ -79,8 +99,9 @@ cmd_connect() {
 cmd_down() { exec nmcli connection down "$1"; }
 
 cmd_down_all() {
-  local rc=0 u
-  for u in $(active_wg_uuids); do
+  local rc=0 u active
+  active="$(active_wg_uuids)" || die "Could not list active connections"
+  for u in $active; do
     nmcli connection down "$u" || rc=1
   done
   exit "$rc"
@@ -213,7 +234,19 @@ cmd_import() {
   local name="$1" old_uuid="${2:-}" src="${3:-}"
   need wg
   need nmcli
-  [[ "$name" =~ ^[A-Za-z0-9_=+.-]{1,15}$ ]] || die "Invalid interface name: $name"
+  # Replacing keeps the old profile's identity. connection.id is a free-form
+  # display name ("Office VPN") while interface-name obeys kernel rules —
+  # they are separate properties, and only the interface name is validated.
+  # A fresh import has no old profile, so there the name serves as both.
+  local ifname="$name" con_id="$name" old_ifname
+  if [ -n "$old_uuid" ]; then
+    con_id="$(nmcli -g connection.id connection show "$old_uuid")" ||
+      die "No such profile: $old_uuid"
+    [ -n "$con_id" ] || con_id="$name"
+    old_ifname="$(nmcli -g connection.interface-name connection show "$old_uuid")" || old_ifname=""
+    [ -n "$old_ifname" ] && ifname="$old_ifname"
+  fi
+  [[ "$ifname" =~ ^[A-Za-z0-9_=+.-]{1,15}$ ]] || die "Invalid interface name: $ifname"
   if [ -n "$src" ]; then
     [ -f "$src" ] || die "No such file: $src"
     exec < "$src"
@@ -221,7 +254,7 @@ cmd_import() {
   parse_config
 
   local -a args=(connection add type wireguard
-    con-name ".$name.import.$$" ifname "$name" autoconnect no)
+    con-name ".$ifname.import.$$" ifname "$ifname" autoconnect no)
   if [ -n "$ADDR4" ]; then args+=(ipv4.method manual ipv4.addresses "$ADDR4")
   else args+=(ipv4.method disabled); fi
   if [ -n "$ADDR6" ]; then args+=(ipv6.method manual ipv6.addresses "$ADDR6")
@@ -283,19 +316,31 @@ cmd_import() {
     done
   fi
 
-  # Replace: the old profile only goes away once the new one is complete,
-  # and deactivation is a hard precondition — on failure the old profile
-  # (and the running tunnel it describes) stays untouched.
+  # Replace, without a window where both profiles are lost: the new profile
+  # takes its final connection.id first (duplicate ids are legal in
+  # NetworkManager), so the old one is deleted only once the replacement is
+  # fully usable — any failure up to that point keeps the old profile.
+  # Whether to reconnect is decided here, from what is active right now, not
+  # from what the UI saw when the edit began — the user may have switched
+  # tunnels while the editor sat open.
+  out="$(nmcli connection modify "$uuid" connection.id "$con_id" 2>&1)" ||
+    fail "Could not rename the imported profile: $out"
   if [ -n "$old_uuid" ]; then
-    if active_wg_uuids | grep -qxF "$old_uuid"; then
+    local was_active=0 active
+    active="$(active_wg_uuids)" || fail "Could not list active connections"
+    printf '%s\n' "$active" | grep -qxF "$old_uuid" && was_active=1
+    if [ "$was_active" = 1 ]; then
       out="$(nmcli connection down "$old_uuid" 2>&1)" ||
         fail "Could not deactivate the old profile: $out"
     fi
     out="$(nmcli connection delete "$old_uuid" 2>&1)" ||
       fail "Could not delete the old profile: $out"
+    if [ "$was_active" = 1 ]; then
+      # The replacement is complete; a failed activation must not delete it.
+      out="$(nmcli connection up "$uuid" 2>&1)" ||
+        die "Profile saved, but reconnecting failed: $out"
+    fi
   fi
-  nmcli connection modify "$uuid" connection.id "$name" ||
-    fail "Could not rename the imported profile"
 }
 
 # ---------------------------------------------------------------------------
@@ -391,13 +436,15 @@ cmd_edit() {
   cat -- "$tmp"
 }
 
+# edit is deliberately unlocked: it holds zenity open for as long as the
+# user cares to type, and the save that follows goes through import anyway.
 case "${1:-}" in
   status) cmd_status ;;
-  connect) cmd_connect "$2" ;;
-  down) cmd_down "$2" ;;
-  down-all) cmd_down_all ;;
-  delete) cmd_delete "$2" ;;
-  import) cmd_import "$2" "${3:-}" "${4:-}" ;;
+  connect) lock; cmd_connect "$2" ;;
+  down) lock; cmd_down "$2" ;;
+  down-all) lock; cmd_down_all ;;
+  delete) lock; cmd_delete "$2" ;;
+  import) lock; cmd_import "$2" "${3:-}" "${4:-}" ;;
   export) cmd_export "$2" ;;
   edit) cmd_edit "$2" "$3" ;;
   *) die "Usage: backend.sh status|connect|down|down-all|delete|import|export|edit ..." ;;

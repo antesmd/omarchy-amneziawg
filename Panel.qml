@@ -14,8 +14,9 @@ Panel {
   property string focusSection: "header"
   property int configIndex: 0
   property bool cursorActive: false
-  // Config name awaiting delete confirmation; non-empty opens the dialog.
-  property string pendingDelete: ""
+  // Profile ({uuid, name}) awaiting delete confirmation; non-null opens the
+  // dialog. A profile object, not a name — names are not unique.
+  property var pendingDelete: null
   // Incoming config awaiting a name; "file" | "text" | "" (no prompt open).
   property string importKind: ""
   property string importPayload: ""
@@ -30,12 +31,12 @@ Panel {
   readonly property string toggleHint: wireguard.active
     ? "Disconnect"
     : (wireguard.toggleTarget !== "" ? "Connect " + wireguard.toggleTarget : "Connect")
-  readonly property bool headerHasCursor: cursorActive && focusSection === "header" && wireguard.configs.length > 0
+  readonly property bool headerHasCursor: cursorActive && focusSection === "header" && wireguard.profiles.length > 0
 
   readonly property bool importPrompt: importKind !== ""
   readonly property string importNameClean: importName.trim()
   readonly property bool importNameValid: wireguard.isValidName(importNameClean)
-  readonly property bool importReplaces: importNameValid && wireguard.configs.indexOf(importNameClean) !== -1
+  readonly property bool importReplaces: importNameValid && wireguard.findByName(importNameClean) !== null
   readonly property string importSourceLabel: importKind === "text"
     ? "Import from clipboard"
     : "Import " + String(importPayload).split("/").pop()
@@ -46,13 +47,13 @@ Panel {
       : "Imports as NetworkManager connection " + importNameClean)
 
   function ensureCursor() {
-    if (wireguard.configs.length === 0) {
+    if (wireguard.profiles.length === 0) {
       focusSection = "header"
       configIndex = 0
       return
     }
     if (focusSection !== "configs" && focusSection !== "header") focusSection = "configs"
-    if (configIndex >= wireguard.configs.length) configIndex = Math.max(0, wireguard.configs.length - 1)
+    if (configIndex >= wireguard.profiles.length) configIndex = Math.max(0, wireguard.profiles.length - 1)
     if (configIndex < 0) configIndex = 0
   }
 
@@ -61,7 +62,7 @@ Panel {
     ensureCursor()
     if (dy === 0) return
     if (focusSection === "header") {
-      if (dy > 0 && wireguard.configs.length > 0) {
+      if (dy > 0 && wireguard.profiles.length > 0) {
         focusSection = "configs"
         configIndex = 0
         scrollCursorIntoView()
@@ -73,7 +74,7 @@ Panel {
         setHeaderCursor()
         return
       }
-      configIndex = Math.max(0, Math.min(wireguard.configs.length - 1, configIndex + dy))
+      configIndex = Math.max(0, Math.min(wireguard.profiles.length - 1, configIndex + dy))
       scrollCursorIntoView()
     }
   }
@@ -91,26 +92,26 @@ Panel {
     scrollCursorIntoView()
   }
 
-  function selectedConfig() {
-    if (wireguard.configs.length === 0) return ""
-    return wireguard.configs[Math.max(0, Math.min(configIndex, wireguard.configs.length - 1))]
+  function selectedProfile() {
+    if (wireguard.profiles.length === 0) return null
+    return wireguard.profiles[Math.max(0, Math.min(configIndex, wireguard.profiles.length - 1))]
   }
 
-  function activateConfig(name) {
-    if (wireguard.busy || !name) return
-    if (wireguard.isActive(name)) wireguard.disconnectOne(name)
-    else wireguard.connectTo(name)
+  function activateConfig(profile) {
+    if (wireguard.busy || !profile) return
+    if (profile.active) wireguard.disconnectOne(profile)
+    else wireguard.connectTo(profile)
   }
 
   function activateCursor() {
     ensureCursor()
     if (focusSection === "header") wireguard.toggle()
-    else if (focusSection === "configs") activateConfig(selectedConfig())
+    else if (focusSection === "configs") activateConfig(selectedProfile())
   }
 
-  function requestDelete(name) {
-    if (wireguard.busy || !name) return
-    pendingDelete = String(name)
+  function requestDelete(profile) {
+    if (wireguard.busy || !profile) return
+    pendingDelete = profile
   }
 
   function beginImport(kind, payload, suggested) {
@@ -138,8 +139,10 @@ Panel {
   }
 
   function scrollCursorIntoView() {
-    if (focusSection !== "configs" || !configColumn) return
-    var item = configColumn.children[configIndex]
+    if (focusSection !== "configs" || !configRepeater) return
+    // itemAt, not configColumn.children[i]: the Repeater itself sits in the
+    // children list ahead of its delegates, so raw indexing is off by one.
+    var item = configRepeater.itemAt(configIndex)
     if (!panelFlick || !item) return
     Qt.callLater(function() {
       if (!item) return
@@ -159,7 +162,7 @@ Panel {
   implicitHeight: button.implicitHeight
 
   onOpenedChanged: {
-    pendingDelete = ""
+    pendingDelete = null
     cancelImport()
     if (opened) {
       cursorActive = false
@@ -177,7 +180,7 @@ Panel {
 
   Connections {
     target: wireguard
-    function onConfigsChanged() { root.ensureCursor() }
+    function onProfilesChanged() { root.ensureCursor() }
     // The picker runs whether or not the popup is open (bar right-click,
     // IPC); open the popup so the name prompt has somewhere to appear.
     function onImportReady(kind, payload, suggestedName) {
@@ -207,8 +210,9 @@ Panel {
       return name
     }
     function edit(name: string): string {
-      if (wireguard.configs.indexOf(name) === -1) return "error: no such config: " + name
-      wireguard.editConfig(name, "")
+      var profile = wireguard.findByName(name)
+      if (!profile) return "error: no such config: " + name
+      wireguard.editConfig(profile, "")
       return "ok"
     }
     function importPick(): string { wireguard.pickConfigFile(); return "ok" }
@@ -252,7 +256,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.pendingDelete !== "" || root.importPrompt
+      blocked: root.pendingDelete !== null || root.importPrompt
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
@@ -261,7 +265,7 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onDeleteRequested: {
-        if (root.cursorActive && root.focusSection === "configs") root.requestDelete(root.selectedConfig())
+        if (root.cursorActive && root.focusSection === "configs") root.requestDelete(root.selectedProfile())
       }
       onTextKey: function(t) {
         if (t === "t" || t === "T") wireguard.toggle()
@@ -270,7 +274,7 @@ Panel {
         else if (t === "i" || t === "I") wireguard.pickConfigFile()
         else if (t === "v" || t === "V") wireguard.pasteConfig()
         else if (t === "e" || t === "E") {
-          if (root.cursorActive && root.focusSection === "configs") wireguard.editConfig(root.selectedConfig(), "")
+          if (root.cursorActive && root.focusSection === "configs") wireguard.editConfig(root.selectedProfile(), "")
         }
       }
 
@@ -303,7 +307,7 @@ Panel {
               id: hero
               width: parent.width
               title: "WireGuard"
-              meta: wireguard.active ? "Connected: " + wireguard.activeConnections.join(", ") : "Disconnected"
+              meta: wireguard.active ? "Connected: " + wireguard.activeNames.join(", ") : "Disconnected"
               foreground: root.foreground
               fontFamily: root.fontFamily
               iconOpacity: wireguard.active ? 1.0 : 0.5
@@ -320,7 +324,7 @@ Panel {
               trailingControl: Component {
                 ToggleSwitch {
                   id: powerSwitch
-                  visible: wireguard.configs.length > 0
+                  visible: wireguard.profiles.length > 0
                   checked: wireguard.active
                   busy: wireguard.busy
                   hasCursor: header.ringVisible
@@ -398,7 +402,7 @@ Panel {
             }
 
             Text {
-              visible: wireguard.configs.length === 0
+              visible: wireguard.profiles.length === 0
               width: parent.width
               text: "No WireGuard connections in NetworkManager\nImport a .conf with + or paste one with v"
               color: root.dim
@@ -410,17 +414,18 @@ Panel {
 
             Column {
               id: configColumn
-              visible: wireguard.configs.length > 0
+              visible: wireguard.profiles.length > 0
               width: parent.width
               spacing: Style.space(6)
 
               Repeater {
-                model: wireguard.configs
+                id: configRepeater
+                model: wireguard.profiles
                 ConfigRow {
                   required property var modelData
                   required property int index
                   width: configColumn.width
-                  configName: String(modelData)
+                  profile: modelData
                   rowIndex: index
                 }
               }
@@ -543,8 +548,8 @@ Panel {
       ConfirmDialog {
         id: deleteDialog
         anchors.fill: parent
-        opened: root.pendingDelete !== ""
-        message: "Delete connection " + root.pendingDelete + "?"
+        opened: root.pendingDelete !== null
+        message: "Delete connection " + (root.pendingDelete ? root.pendingDelete.name : "") + "?"
         confirmText: "Delete"
         foreground: root.foreground
         fontFamily: root.fontFamily
@@ -557,11 +562,11 @@ Panel {
             keyCatcher.forceActiveFocus()
           }
         }
-        onCanceled: root.pendingDelete = ""
+        onCanceled: root.pendingDelete = null
         onConfirmed: {
-          var name = root.pendingDelete
-          root.pendingDelete = ""
-          wireguard.deleteConfig(name)
+          var profile = root.pendingDelete
+          root.pendingDelete = null
+          wireguard.deleteConfig(profile)
         }
       }
     }
@@ -569,9 +574,11 @@ Panel {
 
   component ConfigRow: CursorSurface {
     id: configRow
-    property string configName: ""
+    // {uuid, name, active} — the row keeps the whole profile so its actions
+    // hit exactly this profile even when names collide.
+    property var profile: null
     property int rowIndex: 0
-    readonly property bool connected: wireguard.isActive(configName)
+    readonly property bool connected: profile ? profile.active === true : false
 
     hasCursor: root.cursorActive && root.focusSection === "configs" && root.configIndex === rowIndex
     current: connected
@@ -584,7 +591,7 @@ Panel {
       hoverEnabled: true
       cursorShape: wireguard.busy ? Qt.ArrowCursor : Qt.PointingHandCursor
       onEntered: root.setConfigCursor(configRow.rowIndex)
-      onClicked: root.activateConfig(configRow.configName)
+      onClicked: root.activateConfig(configRow.profile)
     }
 
     RowLayout {
@@ -610,7 +617,7 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: configRow.configName
+          text: configRow.profile ? configRow.profile.name : ""
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -636,7 +643,7 @@ Panel {
         enabled: !wireguard.busy
         visible: configRow.hasCursor
         Layout.alignment: Qt.AlignVCenter
-        onClicked: wireguard.editConfig(configRow.configName, "")
+        onClicked: wireguard.editConfig(configRow.profile, "")
       }
 
       PanelActionButton {
@@ -648,7 +655,7 @@ Panel {
         enabled: !wireguard.busy
         visible: configRow.hasCursor
         Layout.alignment: Qt.AlignVCenter
-        onClicked: root.requestDelete(configRow.configName)
+        onClicked: root.requestDelete(configRow.profile)
       }
     }
   }
