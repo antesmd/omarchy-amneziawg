@@ -1,0 +1,4 @@
+#!/bin/bash
+# Fake notify-send: records the toast instead of showing one.
+echo "notify-send $*" >> "$FAKE_DIR/log"
+exit 0

@@ -1,0 +1,42 @@
+#!/bin/bash
+# Fake nmcli for backend tests. State lives in $FAKE_DIR:
+#   active          one active uuid per line
+#   ifname.<uuid>   configured interface-name
+#   fail-up.<uuid>  if present, `connection up <uuid>` fails
+#   fail-down.<uuid> if present, `connection down <uuid>` fails
+#   log             every invocation, one line
+set -u
+echo "nmcli $*" >> "$FAKE_DIR/log"
+
+case "$*" in
+  "-t -f UUID,TYPE connection show --active")
+    [ -e "$FAKE_DIR/fail-active" ] && { echo "Error: could not list active" >&2; exit 17; }
+    while IFS= read -r u; do printf '%s:wireguard\n' "$u"; done < "$FAKE_DIR/active"
+    exit 0 ;;
+  "-t -f UUID,TYPE,DEVICE,NAME connection show")
+    cat "$FAKE_DIR/list" 2>/dev/null
+    exit 0 ;;
+esac
+
+if [ "$1" = "--escape" ]; then # --escape no -g connection.interface-name connection show <uuid>
+  u="${7}"
+  [ -f "$FAKE_DIR/ifname.$u" ] || exit 10
+  cat "$FAKE_DIR/ifname.$u"
+  exit 0
+fi
+
+if [ "$1" = "connection" ]; then
+  u="$3"
+  case "$2" in
+    up)
+      if [ -e "$FAKE_DIR/fail-up.$u" ]; then echo "Error: activation of $u failed" >&2; exit 4; fi
+      grep -qxF "$u" "$FAKE_DIR/active" || echo "$u" >> "$FAKE_DIR/active"
+      exit 0 ;;
+    down)
+      if [ -e "$FAKE_DIR/fail-down.$u" ]; then echo "Error: deactivation of $u failed" >&2; exit 4; fi
+      grep -vxF "$u" "$FAKE_DIR/active" > "$FAKE_DIR/active.tmp"; mv "$FAKE_DIR/active.tmp" "$FAKE_DIR/active"
+      exit 0 ;;
+  esac
+fi
+echo "fake-nmcli: unhandled: $*" >&2
+exit 99

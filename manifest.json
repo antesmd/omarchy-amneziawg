@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "glafeara.wireguard",
   "name": "WireGuard",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "author": "glafeara",
   "license": "MIT",
-  "description": "WireGuard status, config import, config switching, and quick toggle in the Omarchy bar.",
+  "description": "WireGuard status, transactional tunnel switching, import, rename, QR export, live traffic and drop notifications in the Omarchy bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "WireGuard",
-    "description": "Toggle WireGuard, import .conf files, and switch between NetworkManager WireGuard connections. No sudo required.",
+    "description": "Toggle, switch and rename NetworkManager WireGuard tunnels, import .conf files, show QR codes, watch traffic, get a toast when a tunnel drops. No sudo required.",
     "category": "Network",
     "allowMultiple": false,
     "defaults": {

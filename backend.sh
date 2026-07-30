@@ -20,17 +20,32 @@
 #
 # Commands:
 #   status                      list connections + active wireguard UUIDs
-#   connect <uuid>              exclusive up: other wireguard profiles go down
+#   connect <uuid>              transactional exclusive switch. Exit 0: only
+#                               the target is active. Exit 20: the switch
+#                               failed and the previously active tunnels were
+#                               restored. Exit 21: the switch failed and the
+#                               rollback was incomplete — the resulting state
+#                               is unknown.
 #   down <uuid>                 deactivate one profile
 #   down-all                    deactivate every active wireguard profile
 #   delete <uuid>               delete a profile (deactivates it first)
+#   rename <uuid> <new-id>      change connection.id (the display name);
+#                               the interface name is never touched
 #   import <name> [old-uuid] [file]   build a profile from wg-quick config
 #                               text (stdin, or [file]); replaces [old-uuid],
 #                               keeping its connection.id and interface-name,
 #                               and reconnects if it was active. Exit 5 means
 #                               the profile was saved but reconnecting failed.
 #   export <uuid>               print the profile as wg-quick config text
+#   export-file <uuid> <path>   write the config to a file, mode 0600
+#   qr-png <uuid>               render the config as a QR PNG in
+#                               XDG_RUNTIME_DIR, print its path (exit 2 =
+#                               qrencode missing; the caller deletes the
+#                               file when done)
 #   edit <uuid> <name>          zenity editor round-trip (seed text on stdin)
+#   notify-drop <uuid> <name>   decide whether an observed deactivation was
+#                               external; exit 0 = external (toast sent,
+#                               cooldown permitting), 1 = ours, stay quiet
 
 set -u
 # A failing nmcli at the head of a pipeline must fail the pipeline — status
@@ -55,6 +70,91 @@ lock() {
   flock -w 30 9 || die "Another WireGuard operation is already running"
 }
 
+# ---------------------------------------------------------------------------
+# Intent markers: immediately before this script deactivates a profile it
+# records the UUID, under the flock; when the widget later observes a
+# tunnel going down, notify-drop consults the file to tell a user-initiated
+# drop from an external one (nmcli, NM restart, a dying network) — only the
+# latter deserves a notification. A marker is removed the moment the same
+# UUID comes up again (by us, or observed by the widget via mark-active),
+# so an activation always re-arms the notification. The TTL is only a
+# garbage-collection backstop; it must exceed the widget's slowest poll
+# (refreshIntervalSec caps at 3600), or an instance polling after expiry
+# would toast about a disconnect the user asked for.
+# ---------------------------------------------------------------------------
+
+INTENT_TTL=7200
+
+runtime_state() { printf '%s/omarchy-wireguard.%s.%s' "${XDG_RUNTIME_DIR:-/tmp}" "$(id -u)" "$1"; }
+
+# Marker-file helpers. Failures are swallowed: a missed marker costs one
+# spurious notification, not a broken operation. Both rewrites drop expired
+# entries in passing.
+mark_down() { # <uuid>
+  local uuid="$1" f now u t keep=""
+  f="$(runtime_state intent)"
+  now="$(date +%s)"
+  if [ -f "$f" ]; then
+    while read -r u t; do
+      case "$t" in ''|*[!0-9]*) continue ;; esac
+      [ "$u" = "$uuid" ] && continue
+      [ $((now - t)) -gt "$INTENT_TTL" ] && continue
+      keep="$keep$u $t"$'\n'
+    done < "$f"
+  fi
+  printf '%s' "$keep$uuid $now"$'\n' > "$f" 2>/dev/null || true
+}
+
+# clear_intent <uuid> [observed-epoch]: drop the uuid's marker. With an
+# observation timestamp, only a marker strictly older is dropped — a
+# delayed mark-active from a widget's queue must not erase the record of a
+# down that happened after the observation, and with one-second timestamps
+# a tie is indistinguishable from "after", so a tie keeps the marker (the
+# conservative miss is a suppressed toast, not a false one).
+clear_intent() {
+  local uuid="$1" obs="${2:-}" f now u t keep=""
+  f="$(runtime_state intent)"
+  now="$(date +%s)"
+  [ -f "$f" ] || return 0
+  case "$obs" in *[!0-9]*) obs="" ;; esac
+  while read -r u t; do
+    case "$t" in ''|*[!0-9]*) continue ;; esac
+    [ $((now - t)) -gt "$INTENT_TTL" ] && continue
+    if [ "$u" = "$uuid" ]; then
+      if [ -z "$obs" ] || [ "$t" -lt "$obs" ]; then continue; fi
+    fi
+    keep="$keep$u $t"$'\n'
+  done < "$f"
+  printf '%s' "$keep" > "$f" 2>/dev/null || true
+}
+
+# notify-drop <uuid> <name>: exit 0 = the drop was external (a desktop
+# notification is sent unless one fired within the last 30s — several
+# widget instances all observe the same transition), exit 1 = the drop was
+# our own doing, stay quiet. Runs under the flock so instances serialize.
+cmd_notify_drop() {
+  local uuid="$1" name="$2" f now t u
+  now="$(date +%s)"
+  f="$(runtime_state intent)"
+  if [ -f "$f" ]; then
+    while read -r u t; do
+      case "$t" in ''|*[!0-9]*) continue ;; esac
+      if [ "$u" = "$uuid" ] && [ $((now - t)) -le "$INTENT_TTL" ]; then exit 1; fi
+    done < "$f"
+  fi
+  f="$(runtime_state notified)"
+  if [ -f "$f" ]; then
+    t="$(cat "$f" 2>/dev/null)" || t=0
+    case "$t" in ''|*[!0-9]*) t=0 ;; esac
+    # External, but another instance already said so — no second toast.
+    [ $((now - t)) -lt 30 ] && exit 0
+  fi
+  printf '%s' "$now" > "$f" 2>/dev/null || true
+  command -v notify-send >/dev/null 2>&1 || exit 0
+  notify-send -a WireGuard "WireGuard" "Profile $name was deactivated" 2>/dev/null || true
+  exit 0
+}
+
 valid_key() { printf '%s\n' "$1" | wg pubkey >/dev/null 2>&1; }
 
 is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
@@ -76,39 +176,162 @@ active_wg_uuids() {
   nmcli -t -f UUID,TYPE connection show --active | awk -F: '$2=="wireguard"{print $1}'
 }
 
+# NAME goes last: it is the only field that can contain (escaped) colons,
+# so the QML side can split on the first three and take the rest verbatim.
+# DEVICE is the live interface of an active connection — that, not the
+# configured interface-name, is where /sys traffic counters live. The third
+# section maps each wireguard UUID to its *configured* interface-name:
+# rename decouples the display name from it, and import matches its
+# replace-or-create decision on this, not on the label.
 cmd_status() {
-  nmcli -t -f UUID,NAME,TYPE connection show || exit 1
+  local out actives ifnames uuid ifname
+  out="$(nmcli -t -f UUID,TYPE,DEVICE,NAME connection show)" || exit 1
+  # Everything is gathered before anything is printed, each fetch failing
+  # the whole command: a swallowed error here would read as "no tunnels
+  # up" or "no such interface" — status must never lie about either.
+  actives="$(active_wg_uuids)" || exit 1
+  ifnames=""
+  for uuid in $(printf '%s\n' "$out" | awk -F: '$2=="wireguard"{print $1}'); do
+    ifname="$(nmcli --escape no -g connection.interface-name connection show "$uuid")" || exit 1
+    ifnames="$ifnames$uuid:$ifname"$'\n'
+  done
+  printf '%s\n' "$out"
   echo ---
-  active_wg_uuids
+  [ -n "$actives" ] && printf '%s\n' "$actives"
+  echo ---
+  printf '%s' "$ifnames"
 }
 
+# Transactional exclusive switch. The old tunnel must not be lost to a
+# target that fails to come up: when interface names allow it the new tunnel
+# comes up before the old ones go down (make-before-break — the kernel is
+# fine with several wg interfaces at once), and any failure restores the
+# snapshot of what was active when the switch began. Only wireguard profiles
+# are touched — wifi, tailscale and everything else NetworkManager runs is
+# not ours to bring down.
 cmd_connect() {
-  local target="$1" active u
-  active="$(active_wg_uuids)" || die "Could not list active connections"
-  # Switching is exclusive, but only among wireguard profiles — wifi,
-  # tailscale and everything else NetworkManager runs is not ours to touch.
-  for u in $active; do
-    [ "$u" = "$target" ] && continue
-    nmcli connection down "$u" || exit 1
+  local target="$1" snapshot u out
+  snapshot="$(active_wg_uuids)" || die "Could not list active connections"
+
+  local target_was_active=0 others=""
+  for u in $snapshot; do
+    if [ "$u" = "$target" ]; then target_was_active=1
+    else others="$others$u "; fi
   done
-  for u in $active; do
-    [ "$u" = "$target" ] && exit 0
-  done
-  exec nmcli connection up "$target"
+  [ "$target_was_active" = 1 ] && [ -z "$others" ] && exit 0
+
+  # Overlap is only safe when every interface name involved is known and
+  # distinct: the kernel refuses a second interface with the same name, and
+  # an empty interface-name means NetworkManager picks one at activation —
+  # unknowable in advance, so treated as a collision.
+  local overlap=1 target_if u_if
+  if [ "$target_was_active" = 0 ]; then
+    target_if="$(nmcli --escape no -g connection.interface-name connection show "$target")" ||
+      die "No such profile: $target"
+    [ -n "$target_if" ] || overlap=0
+    for u in $others; do
+      u_if="$(nmcli --escape no -g connection.interface-name connection show "$u")" || u_if=""
+      if [ -z "$u_if" ] || [ "$u_if" = "$target_if" ]; then overlap=0; fi
+    done
+  fi
+
+  # Restore the snapshot: the target back down if it was not active before,
+  # every snapshot member back up. Returns non-zero if anything resisted.
+  restore() {
+    local ok=0 u now
+    now="$(active_wg_uuids)" || return 1
+    if [ "$target_was_active" = 0 ] && printf '%s\n' "$now" | grep -qxF "$target"; then
+      mark_down "$target"
+      nmcli connection down "$target" >/dev/null 2>&1 || { clear_intent "$target"; ok=1; }
+      now="$(active_wg_uuids)" || return 1
+    fi
+    for u in $snapshot; do
+      printf '%s\n' "$now" | grep -qxF "$u" && continue
+      if nmcli connection up "$u" >/dev/null 2>&1; then clear_intent "$u"; else ok=1; fi
+    done
+    return "$ok"
+  }
+
+  fail_switch() {
+    printf '%s\n' "$1" >&2
+    if restore; then
+      echo "The previous tunnels were restored" >&2
+      exit 20
+    fi
+    echo "Restoring the previous tunnels failed too — check your connections" >&2
+    exit 21
+  }
+
+  if [ "$target_was_active" = 0 ] && [ "$overlap" = 0 ]; then
+    # Same or unknown interface name: the old tunnels have to clear the way
+    # first, so the unavoidable no-VPN window gets a rollback instead.
+    for u in $others; do
+      mark_down "$u"
+      out="$(nmcli connection down "$u" 2>&1)" || {
+        clear_intent "$u"
+        fail_switch "Could not deactivate the previous tunnel: $out"
+      }
+    done
+    out="$(nmcli connection up "$target" 2>&1)" ||
+      fail_switch "Could not activate the tunnel: $out"
+    clear_intent "$target"
+  else
+    if [ "$target_was_active" = 0 ]; then
+      # Nothing has changed yet, so a refused activation needs no restore —
+      # but it is still exit 20: the previous tunnels are all still up.
+      out="$(nmcli connection up "$target" 2>&1)" ||
+        fail_switch "Could not activate the tunnel: $out"
+      clear_intent "$target"
+    fi
+    for u in $others; do
+      mark_down "$u"
+      out="$(nmcli connection down "$u" 2>&1)" || {
+        clear_intent "$u"
+        fail_switch "Could not deactivate the previous tunnel: $out"
+      }
+    done
+  fi
 }
 
-cmd_down() { exec nmcli connection down "$1"; }
+cmd_down() {
+  mark_down "$1"
+  nmcli connection down "$1" || { clear_intent "$1"; exit 1; }
+}
 
 cmd_down_all() {
   local rc=0 u active
   active="$(active_wg_uuids)" || die "Could not list active connections"
   for u in $active; do
-    nmcli connection down "$u" || rc=1
+    mark_down "$u"
+    nmcli connection down "$u" || { clear_intent "$u"; rc=1; }
   done
   exit "$rc"
 }
 
-cmd_delete() { exec nmcli connection delete "$1"; }
+cmd_delete() {
+  # Deletion deactivates first; the marker keeps that from reading as an
+  # external drop. A failed delete may leave the profile up — un-mark it.
+  mark_down "$1"
+  nmcli connection delete "$1" || { clear_intent "$1"; exit 1; }
+}
+
+# connection.id is a free-form display label; renaming must never touch
+# connection.interface-name — that one obeys kernel rules and changing it
+# on a live profile would strand the running interface.
+cmd_rename() {
+  local uuid="$1" new_id="$2"
+  new_id="$(trim "$new_id")"
+  [ -n "$new_id" ] || die "The new name must not be empty"
+  case "$new_id" in
+    *$'\n'*) die "The name must be a single line" ;;
+  esac
+  # The QML refuses duplicates too, but each widget instance judges by its
+  # own possibly-stale snapshot — this check under the flock is the
+  # authoritative one. NetworkManager itself would happily take the dup.
+  nmcli --escape no -t -f NAME connection show | grep -qxF "$new_id" &&
+    die "A profile named $new_id already exists"
+  exec nmcli connection modify "$uuid" connection.id "$new_id"
+}
 
 # ---------------------------------------------------------------------------
 # import: parse wg-quick config text into an NM profile.
@@ -334,13 +557,17 @@ cmd_import() {
     active="$(active_wg_uuids)" || fail "Could not list active connections"
     printf '%s\n' "$active" | grep -qxF "$old_uuid" && was_active=1
     if [ "$was_active" = 1 ]; then
-      out="$(nmcli connection down "$old_uuid" 2>&1)" ||
+      mark_down "$old_uuid"
+      out="$(nmcli connection down "$old_uuid" 2>&1)" || {
+        clear_intent "$old_uuid"
         fail "Could not deactivate the old profile: $out"
+      }
     fi
     out="$(nmcli connection delete "$old_uuid" 2>&1)" || {
       # Roll back: the tunnel was only taken down for the swap, so a failed
       # swap must not leave the VPN silently off.
-      [ "$was_active" = 1 ] && nmcli connection up "$old_uuid" >/dev/null 2>&1
+      [ "$was_active" = 1 ] && nmcli connection up "$old_uuid" >/dev/null 2>&1 &&
+        clear_intent "$old_uuid"
       fail "Could not delete the old profile: $out"
     }
     if [ "$was_active" = 1 ]; then
@@ -352,6 +579,7 @@ cmd_import() {
         printf '%s\n' "Saved, but reconnecting failed: $out" >&2
         exit 5
       }
+      clear_intent "$uuid"
     fi
   fi
 }
@@ -428,6 +656,53 @@ cmd_export() {
 }
 
 # ---------------------------------------------------------------------------
+# export-file / qr: the config leaves NetworkManager's root-owned storage
+# with the private key inside, so the handling is deliberate. The file lands
+# with mode 0600 no matter what existed at the destination: written as a
+# 0600 temp in the destination directory, then renamed over the target —
+# plain `umask 077` + `>` would keep a pre-existing file's 0644. The QR PNG
+# lives only in XDG_RUNTIME_DIR (tmpfs on Omarchy, mode 0700, gone by
+# reboot).
+# ---------------------------------------------------------------------------
+
+cmd_export_file() {
+  local uuid="$1" dest="$2" dir tmp
+  [ -n "$dest" ] || die "No destination path"
+  # A directory destination would let mv slide the secret inside it under
+  # the temp file's hidden name — refuse anything but a regular file.
+  [ -d "$dest" ] && die "Destination is a directory: $dest"
+  [ -e "$dest" ] && [ ! -f "$dest" ] && die "Destination is not a regular file: $dest"
+  dir="$(dirname -- "$dest")"
+  [ -d "$dir" ] || die "No such directory: $dir"
+  umask 077
+  tmp="$(mktemp -- "$dir/.wg-export.XXXXXX")" || die "Cannot create a file in $dir"
+  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  cmd_export "$uuid" > "$tmp" || die "Could not export the profile"
+  # -T: dest is the file itself, never a directory to move into.
+  mv -fT -- "$tmp" "$dest" || die "Could not write $dest"
+  trap - EXIT HUP INT TERM
+}
+
+# Renders the PNG and prints its path — the panel displays it inline and
+# deletes it when the QR dialog closes, so the file's lifetime belongs to
+# the caller, not to a trap here. XDG_RUNTIME_DIR is tmpfs with mode 0700:
+# nothing lands on disk, and a crashed caller leaks the file only until
+# reboot.
+cmd_qr_png() {
+  local uuid="$1" dir png
+  command -v qrencode >/dev/null 2>&1 ||
+    { echo "qrencode is not installed — sudo pacman -S qrencode" >&2; exit 2; }
+  dir="${XDG_RUNTIME_DIR:-}"
+  [ -n "$dir" ] && [ -d "$dir" ] ||
+    die "XDG_RUNTIME_DIR is not available — refusing to write key material anywhere less private"
+  umask 077
+  png="$(mktemp -- "$dir/wg-qr.XXXXXX.png")" || die "Cannot create a file in $dir"
+  cmd_export "$uuid" | qrencode -t PNG -s 6 -m 2 -o "$png" ||
+    { rm -f "$png"; die "Could not encode the config as a QR code"; }
+  printf '%s\n' "$png"
+}
+
+# ---------------------------------------------------------------------------
 # edit: zenity round-trip. Exit codes: 2 = no zenity, 3 = Cancel,
 # 4 = saved with no changes. Seed text (a rejected edit being retried)
 # arrives on stdin; empty stdin means a fresh edit of the stored profile.
@@ -457,8 +732,16 @@ case "${1:-}" in
   down) lock; cmd_down "$2" ;;
   down-all) lock; cmd_down_all ;;
   delete) lock; cmd_delete "$2" ;;
+  rename) lock; cmd_rename "$2" "$3" ;;
   import) lock; cmd_import "$2" "${3:-}" "${4:-}" ;;
+  notify-drop) lock; cmd_notify_drop "$2" "$3" ;;
+  # The widget reports profiles it saw come up outside this script, so a
+  # stale "we downed this" marker never mutes a genuinely external drop.
+  # The third argument is when the widget made the observation.
+  mark-active) lock; clear_intent "$2" "${3:-}" ;;
   export) cmd_export "$2" ;;
+  export-file) cmd_export_file "$2" "$3" ;;
+  qr-png) cmd_qr_png "$2" ;;
   edit) cmd_edit "$2" "$3" ;;
-  *) die "Usage: backend.sh status|connect|down|down-all|delete|import|export|edit ..." ;;
+  *) die "Usage: backend.sh status|connect|down|down-all|delete|rename|import|export|export-file|qr-png|edit ..." ;;
 esac

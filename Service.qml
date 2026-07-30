@@ -54,6 +54,24 @@ Item {
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 10, 2, 3600)
 
+  // Traffic sampling: byte counters from /sys for the active tunnels'
+  // devices — readable without privilege. This is activity, not health:
+  // WireGuard has no connection state, and a tunnel that is silent is not
+  // thereby broken. Sampled on a short timer only while the panel is open.
+  property bool trafficMonitoring: false
+  // device -> {rx, tx, at, rxRate, txRate}. The raw counters double as
+  // session totals: NetworkManager creates the wg interface at activation,
+  // so they are zero at connect by construction.
+  property var traffic: ({})
+
+  readonly property var activeDevices: {
+    var out = []
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].active && profiles[i].ifname !== "") out.push(profiles[i].ifname)
+    }
+    return out
+  }
+
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
@@ -68,7 +86,66 @@ Item {
   }
 
   function refresh() {
-    if (!statusProcess.running) statusProcess.running = true
+    if (statusProcess.running) return
+    // The observation time for mark-active is when this snapshot is
+    // *requested* — anything that happens while the poll runs or waits to
+    // be parsed is "after the observation" and must keep its marker.
+    _statusStartedAt = Math.floor(Date.now() / 1000)
+    statusProcess.running = true
+  }
+
+  function sampleTraffic() {
+    if (trafficProcess.running || activeDevices.length === 0) return
+    trafficProcess.command = ["bash", "-c", trafficScript, "wireguard"].concat(activeDevices)
+    trafficProcess.running = true
+  }
+
+  function applyTraffic(raw) {
+    var now = Date.now()
+    var next = {}
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var parts = lines[i].trim().split(/\s+/)
+      if (parts.length !== 3) continue
+      var dev = parts[0]
+      var rx = Number(parts[1])
+      var tx = Number(parts[2])
+      if (!isFinite(rx) || !isFinite(tx)) continue
+      var prev = traffic[dev]
+      var dt = prev ? (now - prev.at) / 1000 : 0
+      // A first sample, restarted counters (the interface was recreated
+      // behind our back) or a gap left by a closed panel all make the delta
+      // meaningless: keep the totals, hold the rate at zero for one tick.
+      if (!prev || rx < prev.rx || tx < prev.tx || dt <= 0 || dt > 30) {
+        next[dev] = { rx: rx, tx: tx, at: now, rxRate: 0, txRate: 0 }
+      } else {
+        next[dev] = { rx: rx, tx: tx, at: now,
+          rxRate: (rx - prev.rx) / dt, txRate: (tx - prev.tx) / dt }
+      }
+    }
+    // Wholesale replacement drops devices that vanished with their tunnels.
+    traffic = next
+  }
+
+  // Single-letter units and one decimal at most: the line has to share a
+  // caption row with three action buttons, so every character counts.
+  function fmtBytes(n) {
+    var v = Number(n) || 0
+    if (v < 1024) return Math.round(v) + "B"
+    var units = ["K", "M", "G", "T"]
+    for (var i = 0; i < units.length; i++) {
+      v /= 1024
+      if (v < 1024 || i === units.length - 1) break
+    }
+    return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + units[i]
+  }
+
+  // One caption line: current rate, then session totals.
+  function trafficLine(dev) {
+    var t = traffic[String(dev || "")]
+    if (!t) return ""
+    return "↓ " + fmtBytes(t.rxRate) + "/s ↑ " + fmtBytes(t.txRate) + "/s"
+      + " · ↓ " + fmtBytes(t.rx) + " ↑ " + fmtBytes(t.tx)
   }
 
   // First profile with this name, or null. Only for the name-based entry
@@ -81,6 +158,28 @@ Item {
       if (profiles[i].name === value) return profiles[i]
     }
     return null
+  }
+
+  // Replace-or-create on import is decided by the *configured* interface
+  // name, not the display name: rename moves the label freely, but the
+  // interface is what a re-imported config actually collides with.
+  function findByIfname(ifname) {
+    var value = String(ifname || "")
+    if (value === "") return null
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].confIfname === value) return profiles[i]
+    }
+    return null
+  }
+
+  function countByIfname(ifname) {
+    var value = String(ifname || "")
+    if (value === "") return 0
+    var n = 0
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].confIfname === value) n++
+    }
+    return n
   }
 
   function findByUuid(uuid) {
@@ -117,20 +216,25 @@ Item {
       _pollError = true
       return
     }
+    var sep2 = lines.indexOf("---", sep + 1)
+    var activeEnd = sep2 === -1 ? lines.length : sep2
     var list = []
     var byUuid = {}
     for (var i = 0; i < sep; i++) {
-      // uuid:name:type — the UUID contains no colons and the type is the
-      // last field, so the name is everything in between; nmcli -t escapes
-      // colons inside it as "\:".
+      // uuid:type:device:name — the name goes last because it is the only
+      // field that can contain colons (escaped by nmcli -t as "\:"); the
+      // device is the live interface of an active connection, "" otherwise.
       var line = lines[i]
-      var first = line.indexOf(":")
-      var last = line.lastIndexOf(":")
-      if (first === -1 || last <= first) continue
-      if (line.slice(last + 1) !== "wireguard") continue
+      var a = line.indexOf(":")
+      var b = a === -1 ? -1 : line.indexOf(":", a + 1)
+      var c = b === -1 ? -1 : line.indexOf(":", b + 1)
+      if (c === -1) continue
+      if (line.slice(a + 1, b) !== "wireguard") continue
       var entry = {
-        uuid: line.slice(0, first),
-        name: line.slice(first + 1, last).replace(/\\:/g, ":").replace(/\\\\/g, "\\"),
+        uuid: line.slice(0, a),
+        ifname: line.slice(b + 1, c),
+        confIfname: "",
+        name: line.slice(c + 1).replace(/\\:/g, ":").replace(/\\\\/g, "\\"),
         active: false
       }
       list.push(entry)
@@ -138,12 +242,47 @@ Item {
     }
     list.sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0) })
     var firstUp = ""
-    for (var j = sep + 1; j < lines.length; j++) {
+    for (var j = sep + 1; j < activeEnd; j++) {
       var uuid = lines[j].trim()
       if (uuid === "" || byUuid[uuid] === undefined) continue
       byUuid[uuid].active = true
       if (firstUp === "") firstUp = uuid
     }
+    // Third section: uuid:configured-interface-name (no colons in either).
+    if (sep2 !== -1) {
+      for (var m = sep2 + 1; m < lines.length; m++) {
+        var pos = lines[m].indexOf(":")
+        if (pos === -1) continue
+        var owner = byUuid[lines[m].slice(0, pos)]
+        if (owner !== undefined) owner.confIfname = lines[m].slice(pos + 1)
+      }
+    }
+    // Transitions against the previous poll. Every profile that went down
+    // is queued for notify-drop — the backend's intent markers decide,
+    // under the lock, which drops were ours; judging only the first could
+    // hide an external drop behind an intentional one. Every profile that
+    // came up re-arms its marker via mark-active, so an activation the
+    // widget merely observed (nmcli up) gets its notifications back.
+    var droppedNow = []
+    for (var uuid0 in _prevActive) {
+      var cur = byUuid[uuid0]
+      if (cur === undefined || !cur.active) droppedNow.push({ uuid: uuid0, name: _prevActive[uuid0] })
+    }
+    var nowActive = {}
+    var observedAt = String(_statusStartedAt > 0 ? _statusStartedAt : Math.floor(Date.now() / 1000))
+    for (var k = 0; k < list.length; k++) {
+      if (!list[k].active) continue
+      nowActive[list[k].uuid] = list[k].name
+      // Queued, not fired directly: the process may be busy, and a lost
+      // activation would leave a stale marker muting a real drop for up to
+      // the TTL. The observation time rides along so a delayed mark-active
+      // cannot erase the record of a down that happened after it.
+      if (_prevActive[list[k].uuid] === undefined) _markQueue.push(list[k].uuid + ":" + observedAt)
+    }
+    _prevActive = nowActive
+    for (var d = 0; d < droppedNow.length; d++) _dropQueue.push(droppedNow[d])
+    _flushDrops()
+    _flushMarkActive()
     profiles = list
     // Track connects made outside the widget too (nmcli, GUI).
     if (firstUp !== "") rememberLast(firstUp)
@@ -189,6 +328,16 @@ Item {
     if (busy || !profile || !profile.uuid) return
     actionStatus = "Deleting " + profile.name + "…"
     runControl(["delete", profile.uuid])
+  }
+
+  // Changes connection.id only — a display label, so spaces and length are
+  // fine. The interface name never moves; that is import's job.
+  function renameConfig(profile, newName) {
+    if (busy || !profile || !profile.uuid) return
+    var value = String(newName || "").trim()
+    if (value === "" || value === profile.name) return
+    actionStatus = "Renaming " + profile.name + "…"
+    runControl(["rename", profile.uuid, value])
   }
 
   function toggle() {
@@ -239,6 +388,64 @@ Item {
     editProcess.running = true
   }
 
+  // Export hands the config — private key included — out of NetworkManager's
+  // storage. File export is IPC-only (an explicit path in argv is already a
+  // deliberate act); the QR is rendered by the backend into XDG_RUNTIME_DIR
+  // and displayed inline by the panel, which owns the PNG until closeQr.
+  property string qrPath: ""
+  property string qrName: ""
+
+  function exportToPath(profile, path) {
+    if (!profile || !profile.uuid || exportProcess.running) return
+    var dest = String(path || "")
+    if (dest === "") return
+    lastError = ""
+    _exportDest = dest
+    actionStatus = "Exporting " + profile.name + "…"
+    exportProcess.command = ["bash", backendPath, "export-file", profile.uuid, dest]
+    exportProcess.running = true
+  }
+
+  function showQr(profile) {
+    if (!profile || !profile.uuid || qrProcess.running) return
+    closeQr()
+    _qrWanted = true
+    _qrPendingName = String(profile.name)
+    lastError = ""
+    actionStatus = "QR code for " + profile.name + "…"
+    qrProcess.command = ["bash", backendPath, "qr-png", profile.uuid]
+    qrProcess.running = true
+  }
+
+  function closeQr() {
+    // Also retracts a request still in flight: the panel may close while
+    // qr-png runs, and a PNG nobody is waiting for must not linger — the
+    // process handler deletes an unwanted result instead of keeping it.
+    _qrWanted = false
+    if (qrPath !== "") {
+      qrCleanupProcess.command = ["rm", "-f", "--", qrPath]
+      qrCleanupProcess.running = true
+    }
+    qrPath = ""
+    qrName = ""
+  }
+
+  function _flushDrops() {
+    if (notifyProcess.running || _dropQueue.length === 0) return
+    var drop = _dropQueue.shift()
+    _notifyDropName = drop.name
+    notifyProcess.command = ["bash", backendPath, "notify-drop", drop.uuid, drop.name]
+    notifyProcess.running = true
+  }
+
+  function _flushMarkActive() {
+    if (markActiveProcess.running || _markQueue.length === 0) return
+    _markInFlight = _markQueue
+    _markQueue = []
+    markActiveProcess.command = ["bash", "-c", markActiveScript, "wireguard", backendPath].concat(_markInFlight)
+    markActiveProcess.running = true
+  }
+
   // Puts rejected text back in front of the user with the reason showing.
   // Deferred through a timer because the editor process that produced the
   // text is still winding down when the rejection lands.
@@ -256,11 +463,11 @@ Item {
   // clearer message; this is the backstop for the headless entry points.
   function importFile(path, name) {
     if (busy || !path || !name) return
-    if (countByName(name) > 1) {
-      lastError = "Several profiles are named " + name + " — not replacing an ambiguous match"
+    if (countByIfname(name) > 1) {
+      lastError = "Several profiles use the interface " + name + " — not replacing an ambiguous match"
       return
     }
-    var existing = findByName(name)
+    var existing = findByIfname(name)
     actionStatus = "Importing " + name + "…"
     runControl(["import", String(name), existing ? existing.uuid : "", String(path)])
   }
@@ -288,11 +495,11 @@ Item {
 
   function importText(text, name) {
     if (busy || !text || !name) return
-    if (countByName(name) > 1) {
-      lastError = "Several profiles are named " + name + " — not replacing an ambiguous match"
+    if (countByIfname(name) > 1) {
+      lastError = "Several profiles use the interface " + name + " — not replacing an ambiguous match"
       return
     }
-    var existing = findByName(name)
+    var existing = findByIfname(name)
     actionStatus = "Importing " + name + "…"
     runControl(["import", String(name), existing ? existing.uuid : ""], String(text))
   }
@@ -318,10 +525,11 @@ Item {
     return /^[ \t]*\[Interface\]/m.test(value) && /PrivateKey[ \t]*=/i.test(value)
   }
 
-  // Pasted text carries no name of its own — offer the first free wgN.
+  // Pasted text carries no name of its own — offer the first wgN free as
+  // both an interface and a label.
   function suggestName() {
     for (var i = 0; i < 100; i++) {
-      if (!findByName("wg" + i)) return "wg" + i
+      if (!findByIfname("wg" + i) && !findByName("wg" + i)) return "wg" + i
     }
     return "wg"
   }
@@ -331,6 +539,7 @@ Item {
   // lives, and config text contains the private key.
   function runControl(args, stdinData) {
     _controlError = ""
+    _controlOperation = String(args[0])
     _controlStdin = stdinData === undefined ? "" : String(stdinData)
     controlProcess.stdinEnabled = true
     controlProcess.command = ["bash", backendPath].concat(args)
@@ -360,16 +569,53 @@ Item {
     "fi\n" +
     "exit 2\n"
 
+  // Device names come from the kernel — no spaces, no globs to worry about.
+  readonly property string trafficScript:
+    "for d in \"$@\"; do\n" +
+    "  s=\"/sys/class/net/$d/statistics\"\n" +
+    "  [ -r \"$s/rx_bytes\" ] && [ -r \"$s/tx_bytes\" ] || continue\n" +
+    "  printf '%s %s %s\\n' \"$d\" \"$(cat \"$s/rx_bytes\")\" \"$(cat \"$s/tx_bytes\")\"\n" +
+    "done\n"
+
   readonly property string clipboardScript:
     "command -v wl-paste >/dev/null 2>&1 || exit 2\n" +
     "wl-paste --no-newline --type text/plain 2>/dev/null || wl-paste --no-newline\n"
 
   property string _controlError: ""
+  // Which backend command controlProcess is running: special exit codes
+  // (5 for import, 20/21 for connect) mean nothing outside their command.
+  property string _controlOperation: ""
   property string _controlStdin: ""
   // True while lastError describes a failed status poll, so a successful
   // poll knows it may clear it.
   property bool _pollError: false
   property string _pendingConnect: ""
+  property string _exportDest: ""
+  property string _qrPendingName: ""
+  // uuid -> name of the profiles active at the previous status poll.
+  property var _prevActive: ({})
+  property string _notifyDropName: ""
+  // Observed drops waiting for their notify-drop verdict, one at a time.
+  property var _dropQueue: []
+  // Observed activations ("uuid:epoch") waiting to re-arm their markers,
+  // and the batch currently being processed — returned to the queue if the
+  // backend fails (clear_intent is idempotent, so replays are safe).
+  property var _markQueue: []
+  property var _markInFlight: []
+  // Epoch seconds of the moment the running status poll was requested.
+  property double _statusStartedAt: 0
+  // False once the QR dialog (or the panel) closed — a result arriving
+  // afterwards is deleted, not displayed.
+  property bool _qrWanted: false
+
+  // Each argument is "uuid:observed-epoch"; UUIDs contain no colons. Every
+  // pair is attempted; any failure fails the batch, which the caller then
+  // requeues whole — replays are idempotent.
+  readonly property string markActiveScript:
+    "be=\"$1\"; shift\n" +
+    "rc=0\n" +
+    "for pair in \"$@\"; do bash \"$be\" mark-active \"${pair%%:*}\" \"${pair#*:}\" || rc=1; done\n" +
+    "exit $rc\n"
   property string _editUuid: ""
   property string _editName: ""
   property string _editSeed: ""
@@ -421,6 +667,16 @@ Item {
     running: true
     triggeredOnStart: true
     onTriggered: root.refresh()
+  }
+
+  // Short-lived by design: refreshIntervalSec is far too coarse for a rate
+  // readout, and a 2s cadence is only worth paying for while someone looks.
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.trafficMonitoring && root.activeDevices.length > 0
+    triggeredOnStart: true
+    onTriggered: root.sampleTraffic()
   }
 
   Process {
@@ -545,6 +801,118 @@ Item {
   }
 
   Process {
+    id: exportProcess
+    running: false
+    command: []
+    stderr: StdioCollector {
+      id: exportStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      var dest = root._exportDest
+      root._exportDest = ""
+      if (exitCode === 0) {
+        // Success worth stating: the visible outcome is a file somewhere
+        // else, not a change in the panel.
+        root.actionStatus = "Exported to " + dest
+      } else {
+        root.actionStatus = ""
+        root.lastError = root.elide(exportStderr.text || "Export failed")
+      }
+    }
+  }
+
+  Process {
+    id: qrProcess
+    running: false
+    command: []
+    stdout: StdioCollector {
+      id: qrStdout
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      id: qrStderr
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.actionStatus = ""
+      var name = root._qrPendingName
+      root._qrPendingName = ""
+      if (exitCode === 0) {
+        var path = String(qrStdout.text || "").trim()
+        if (path === "") {
+          root.lastError = "Could not render the QR code"
+          return
+        }
+        // The dialog (or panel) closed while we rendered: the result is
+        // key material nobody is looking at — delete it immediately.
+        if (!root._qrWanted) {
+          qrCleanupProcess.command = ["rm", "-f", "--", path]
+          qrCleanupProcess.running = true
+          return
+        }
+        root.qrPath = path
+        root.qrName = name
+      } else {
+        // 2 = qrencode missing, with the install hint on stderr.
+        root.lastError = root.elide(qrStderr.text || "Could not render the QR code")
+      }
+    }
+  }
+
+  Process {
+    id: qrCleanupProcess
+    running: false
+    command: []
+  }
+
+  Process {
+    id: notifyProcess
+    running: false
+    command: []
+    onExited: function(exitCode) {
+      var name = root._notifyDropName
+      root._notifyDropName = ""
+      // 0 = the backend judged the drop external. The message lands in
+      // lastError so the bar icon turns urgent and the panel says why; any
+      // successful operation clears it, like every other error.
+      if (exitCode === 0 && name !== "") root.lastError = "Profile " + name + " was deactivated"
+      Qt.callLater(root._flushDrops)
+    }
+  }
+
+  Process {
+    id: markActiveProcess
+    running: false
+    command: []
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root._markInFlight = []
+        // Drain whatever queued while this batch ran.
+        Qt.callLater(root._flushMarkActive)
+      } else {
+        // Give the batch back and retry on the next poll — an immediate
+        // retry against a persistently failing backend would spin.
+        root._markQueue = root._markInFlight.concat(root._markQueue)
+        root._markInFlight = []
+      }
+    }
+  }
+
+  Process {
+    id: trafficProcess
+    running: false
+    command: []
+    stdout: StdioCollector {
+      id: trafficStdout
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.applyTraffic(trafficStdout.text)
+    }
+  }
+
+  Process {
     id: controlProcess
     running: false
     command: []
@@ -561,13 +929,16 @@ Item {
       onStreamFinished: root._controlError = text
     }
     onExited: function(exitCode) {
+      var op = root._controlOperation
+      root._controlOperation = ""
       // 5 (import only) = the profile was saved but reconnecting it failed.
       // That is a success as far as the edit is concerned — reopening the
       // editor would target the already-deleted old profile — so the retry
       // state is cleared and only the reason is shown.
-      if (exitCode === 0 || exitCode === 5) {
+      var savedNotUp = op === "import" && exitCode === 5
+      if (exitCode === 0 || savedNotUp) {
         if (root._pendingConnect !== "") root.rememberLast(root._pendingConnect)
-        root.lastError = exitCode === 5
+        root.lastError = savedNotUp
           ? root.elide(root._controlError || "Saved, but reconnecting failed")
           : ""
         root.actionStatus = ""
@@ -576,10 +947,13 @@ Item {
         root._editRetryText = ""
       } else {
         root.actionStatus = ""
+        // 20/21 (connect only): the switch failed; the backend's stderr says
+        // whether the previous tunnels were restored (20) or the rollback
+        // itself failed (21). Either way the poll below shows what is up.
         var reason = root.elide(root._controlError || "NetworkManager operation failed")
         // A write refused by wg_check must not cost the edit that produced
         // it; hand the text back to the editor with the reason attached.
-        if (root._editRetryName !== "") root.retryEdit(root._editRetryUuid, root._editRetryName, root._editRetryText, reason)
+        if (op === "import" && root._editRetryName !== "") root.retryEdit(root._editRetryUuid, root._editRetryName, root._editRetryText, reason)
         else root.lastError = reason
       }
       root._pendingConnect = ""

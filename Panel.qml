@@ -20,38 +20,63 @@ Panel {
   // Incoming config awaiting a name; "file" | "text" | "" (no prompt open).
   property string importKind: ""
   property string importPayload: ""
-  property string importName: ""
+  // Profile ({uuid, name}) awaiting a new display name; non-null while the
+  // rename dialog is open.
+  property var pendingRename: null
+  // Profile whose pencil was clicked — the chooser asks whether to edit
+  // the config or the name; keyboard users go straight there with e / n.
+  property var pendingEdit: null
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color iconColor: wireguard.active ? foreground : dim
-  readonly property color barIconColor: wireguard.active ? barForeground : Qt.darker(barForeground, 1.55)
+  // Urgent trumps everything: a failed operation or an externally dropped
+  // tunnel must be visible without opening the panel.
+  readonly property color barIconColor: wireguard.lastError !== ""
+    ? (bar ? bar.urgent : Color.urgent)
+    : (wireguard.active ? barForeground : Qt.darker(barForeground, 1.55))
   readonly property string toggleHint: wireguard.active
     ? "Disconnect"
     : (wireguard.toggleTarget !== "" ? "Connect " + wireguard.toggleTarget : "Connect")
   readonly property bool headerHasCursor: cursorActive && focusSection === "header" && wireguard.profiles.length > 0
 
-  readonly property bool importPrompt: importKind !== ""
-  readonly property string importNameClean: importName.trim()
+  readonly property string importNameClean: importDialog.value.trim()
   readonly property bool importNameValid: wireguard.isValidName(importNameClean)
-  readonly property int importNameCount: importNameValid ? wireguard.countByName(importNameClean) : 0
+  // Matching is by configured interface-name: rename can move the display
+  // name anywhere, but the interface is what a re-import collides with.
+  readonly property int importNameCount: importNameValid ? wireguard.countByIfname(importNameClean) : 0
   readonly property bool importReplaces: importNameCount === 1
-  // Several existing profiles share the typed name — "replace" cannot know
-  // which one is meant, so the import is refused under this name.
+  // Several existing profiles use the typed interface — "replace" cannot
+  // know which one is meant, so the import is refused under this name.
   readonly property bool importAmbiguous: importNameCount > 1
   readonly property bool importAccepted: importNameValid && !importAmbiguous
+  readonly property var importReplaceTarget: importReplaces ? wireguard.findByIfname(importNameClean) : null
   readonly property string importSourceLabel: importKind === "text"
     ? "Import from clipboard"
     : "Import " + String(importPayload).split("/").pop()
   readonly property string importHintText: !importNameValid
     ? "Up to 15 characters: letters, digits and . _ - = +"
     : (importAmbiguous
-      ? importNameCount + " profiles share the name " + importNameClean + " — pick another name"
+      ? importNameCount + " profiles use the interface " + importNameClean + " — pick another name"
       : (importReplaces
-        ? "Replaces the existing connection " + importNameClean
+        ? "Replaces the existing connection " + (importReplaceTarget ? importReplaceTarget.name : importNameClean)
         : "Imports as NetworkManager connection " + importNameClean))
+
+  // Rename touches connection.id only — a free-form label, so spaces are
+  // fine. Duplicates are refused: every name-based entry point in the
+  // widget treats an ambiguous name as an error, so don't let one be made.
+  readonly property string renameClean: renameDialog.value.trim()
+  readonly property bool renameDuplicate: renameClean !== ""
+    && (pendingRename === null || renameClean !== pendingRename.name)
+    && wireguard.countByName(renameClean) > 0
+  readonly property bool renameAccepted: pendingRename !== null && renameClean !== "" && !renameDuplicate
+  readonly property string renameHint: renameClean === ""
+    ? "The name must not be empty"
+    : (renameDuplicate
+      ? "A profile named " + renameClean + " already exists"
+      : "Display name only — the interface name does not change")
 
   function ensureCursor() {
     if (wireguard.profiles.length === 0) {
@@ -126,13 +151,45 @@ Panel {
     importPayload = String(payload)
     // A sanitized provider filename can come back empty ("~/VPN (1).conf");
     // fall back to a free wgN rather than opening the prompt on nothing.
-    importName = suggested !== "" ? String(suggested) : wireguard.suggestName()
+    importDialog.openWith(suggested !== "" ? String(suggested) : wireguard.suggestName())
   }
 
   function cancelImport() {
     importKind = ""
     importPayload = ""
-    importName = ""
+    importDialog.dismiss()
+  }
+
+  function requestEdit(profile) {
+    if (wireguard.busy || !profile) return
+    pendingEdit = profile
+  }
+
+  function confirmEdit(kind) {
+    var profile = pendingEdit
+    pendingEdit = null
+    if (!profile || kind === "") return
+    if (kind === "name") requestRename(profile)
+    else wireguard.editConfig(profile, "")
+  }
+
+  function requestRename(profile) {
+    if (wireguard.busy || !profile) return
+    pendingRename = profile
+    renameDialog.openWith(profile.name)
+  }
+
+  function cancelRename() {
+    pendingRename = null
+    renameDialog.dismiss()
+  }
+
+  function confirmRename() {
+    if (!renameAccepted) return
+    var profile = pendingRename
+    var name = renameClean
+    cancelRename()
+    wireguard.renameConfig(profile, name)
   }
 
   function confirmImport() {
@@ -170,7 +227,10 @@ Panel {
 
   onOpenedChanged: {
     pendingDelete = null
+    pendingEdit = null
+    wireguard.closeQr()
     cancelImport()
+    cancelRename()
     if (opened) {
       cursorActive = false
       if (panelFlick) panelFlick.contentY = 0
@@ -183,6 +243,7 @@ Panel {
   Service {
     id: wireguard
     settings: root.settings
+    trafficMonitoring: root.opened
   }
 
   Connections {
@@ -213,7 +274,7 @@ Panel {
     function importConfig(path: string): string {
       var name = wireguard.sanitizeName(path)
       if (!wireguard.isValidName(name)) return "error: cannot derive an interface name from " + path
-      if (wireguard.countByName(name) > 1) return "error: ambiguous name: several profiles are named " + name
+      if (wireguard.countByIfname(name) > 1) return "error: ambiguous: several profiles use the interface " + name
       wireguard.importFile(path, name)
       return name
     }
@@ -230,8 +291,52 @@ Panel {
       wireguard.editConfig(profile, "")
       return "ok"
     }
+    // Same target resolution as edit; the new name is a display label, so
+    // anything single-line goes — except a name another profile already
+    // holds, which would poison every name-based entry point.
+    function rename(target: string, newName: string): string {
+      var profile = wireguard.findByUuid(target)
+      if (!profile) {
+        var n = wireguard.countByName(target)
+        if (n === 0) return "error: no such config: " + target
+        if (n > 1) return "error: ambiguous name: " + target + " — use a UUID: " + wireguard.uuidsForName(target).join(" ")
+        profile = wireguard.findByName(target)
+      }
+      var value = String(newName || "").trim()
+      if (value === "") return "error: the new name must not be empty"
+      if (value !== profile.name && wireguard.countByName(value) > 0) return "error: a profile named " + value + " already exists"
+      wireguard.renameConfig(profile, value)
+      return "ok"
+    }
     function importPick(): string { wireguard.pickConfigFile(); return "ok" }
     function importPaste(): string { wireguard.pasteConfig(); return "ok" }
+    // Headless export — no warning dialog: an explicit path in argv is
+    // already deliberate in a way a panel click is not. The file lands 0600.
+    function exportConfig(target: string, path: string): string {
+      var profile = wireguard.findByUuid(target)
+      if (!profile) {
+        var n = wireguard.countByName(target)
+        if (n === 0) return "error: no such config: " + target
+        if (n > 1) return "error: ambiguous name: " + target + " — use a UUID: " + wireguard.uuidsForName(target).join(" ")
+        profile = wireguard.findByName(target)
+      }
+      if (String(path || "") === "") return "error: no destination path"
+      wireguard.exportToPath(profile, path)
+      return "ok"
+    }
+    // The QR dialog lives inside the panel, so showing it implies opening.
+    function qr(target: string): string {
+      var profile = wireguard.findByUuid(target)
+      if (!profile) {
+        var n = wireguard.countByName(target)
+        if (n === 0) return "error: no such config: " + target
+        if (n > 1) return "error: ambiguous name: " + target + " — use a UUID: " + wireguard.uuidsForName(target).join(" ")
+        profile = wireguard.findByName(target)
+      }
+      root.open()
+      wireguard.showQr(profile)
+      return "ok"
+    }
   }
 
   BarIconButton {
@@ -271,7 +376,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.pendingDelete !== null || root.importPrompt
+      blocked: root.pendingDelete !== null || root.pendingEdit !== null || qrDialog.visible || importDialog.visible || renameDialog.visible
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
@@ -290,6 +395,12 @@ Panel {
         else if (t === "v" || t === "V") wireguard.pasteConfig()
         else if (t === "e" || t === "E") {
           if (root.cursorActive && root.focusSection === "configs") wireguard.editConfig(root.selectedProfile(), "")
+        }
+        else if (t === "n" || t === "N") {
+          if (root.cursorActive && root.focusSection === "configs") root.requestRename(root.selectedProfile())
+        }
+        else if (t === "q" || t === "Q") {
+          if (root.cursorActive && root.focusSection === "configs") wireguard.showQr(root.selectedProfile())
         }
       }
 
@@ -453,21 +564,80 @@ Panel {
       // The interface name is derived from the filename, so the name
       // is the one thing neither a picked file nor pasted text can supply
       // reliably — and it doubles as the replace-or-not decision.
-      Item {
+      NamePrompt {
         id: importDialog
         anchors.fill: parent
-        visible: root.importPrompt
+        title: root.importSourceLabel
+        placeholder: "Interface name"
+        hint: root.importHintText
+        accepted: root.importAccepted
+        confirmLabel: root.importReplaces ? "Replace" : "Import"
+        onConfirmed: root.confirmImport()
+        onCanceled: root.cancelImport()
+      }
+
+      NamePrompt {
+        id: renameDialog
+        anchors.fill: parent
+        title: "Rename " + (root.pendingRename ? root.pendingRename.name : "")
+        placeholder: "Connection name"
+        hint: root.renameHint
+        accepted: root.renameAccepted
+        confirmLabel: "Rename"
+        onConfirmed: root.confirmRename()
+        onCanceled: root.cancelRename()
+      }
+
+      // One pencil, two targets: the chooser splits "edit" into the config
+      // text (zenity round-trip) and the display name (rename prompt).
+      // Keyboard users never see it — e and n go straight to either.
+      Item {
+        id: editChooser
+        anchors.fill: parent
+        visible: root.pendingEdit !== null
+
+        property int selectedIndex: 1
+        readonly property var choices: [
+          { label: "Cancel", kind: "" },
+          { label: "Config", kind: "config" },
+          { label: "Name", kind: "name" }
+        ]
+
+        onVisibleChanged: {
+          if (visible) {
+            selectedIndex = 1
+            editChooser.forceActiveFocus()
+          } else if (root.pendingRename === null) {
+            // Choosing "Name" hands focus to the rename prompt, not back
+            // to the list.
+            keyCatcher.forceActiveFocus()
+          }
+        }
+        Keys.onPressed: function(event) {
+          if (event.key === Qt.Key_Escape) root.pendingEdit = null
+          else if (event.key === Qt.Key_Left || event.key === Qt.Key_Backtab)
+            selectedIndex = (selectedIndex + choices.length - 1) % choices.length
+          else if (event.key === Qt.Key_Right || event.key === Qt.Key_Tab)
+            selectedIndex = (selectedIndex + 1) % choices.length
+          else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+            root.confirmEdit(choices[selectedIndex].kind)
+          else if (event.key === Qt.Key_E || event.key === Qt.Key_C) root.confirmEdit("config")
+          else if (event.key === Qt.Key_N) root.confirmEdit("name")
+          else return
+          event.accepted = true
+        }
 
         Rectangle {
           anchors.fill: parent
           color: Util.alpha(Color.background, 0.7)
 
-          MouseArea { anchors.fill: parent; onClicked: root.cancelImport() }
+          MouseArea { anchors.fill: parent; onClicked: root.pendingEdit = null }
 
           BorderSurface {
-            id: importCard
+            id: editCard
             width: Math.min(parent.width - Style.space(32), Style.space(340))
-            height: importCard.contentTopInset + importCard.contentBottomInset + importColumn.implicitHeight
+            height: editCard.contentTopInset + editCard.contentBottomInset
+              + editMessage.implicitHeight + Style.space(20) + Style.space(34)
             anchors.centerIn: parent
             color: Color.background
             borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
@@ -476,86 +646,160 @@ Panel {
 
             MouseArea { anchors.fill: parent; onClicked: {} }
 
-            Column {
-              id: importColumn
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.top: parent.top
-              anchors.topMargin: importCard.contentTopInset
-              anchors.leftMargin: importCard.contentLeftInset
-              anchors.rightMargin: importCard.contentRightInset
-              spacing: Style.space(10)
+            Item {
+              anchors.fill: parent
+              anchors.topMargin: editCard.contentTopInset
+              anchors.rightMargin: editCard.contentRightInset
+              anchors.bottomMargin: editCard.contentBottomInset
+              anchors.leftMargin: editCard.contentLeftInset
 
               Text {
-                width: parent.width
-                text: root.importSourceLabel
+                id: editMessage
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                text: "Edit " + (root.pendingEdit ? root.pendingEdit.name : "") + "?"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
-                elide: Text.ElideMiddle
+                wrapMode: Text.WordWrap
               }
 
-              TextField {
-                id: nameField
-                width: parent.width
-                placeholderText: "Interface name"
-                foreground: root.foreground
-                font.family: root.fontFamily
-                text: root.importName
+              Row {
+                id: editButtonsRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                spacing: Style.space(10)
 
-                onTextChanged: if (text !== root.importName) root.importName = text
-                onAccepted: root.confirmImport()
-                Keys.onEscapePressed: root.cancelImport()
-              }
+                Repeater {
+                  model: editChooser.choices
 
-              Text {
-                width: parent.width
-                text: root.importHintText
-                color: root.importAccepted ? root.dim : root.urgent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WrapAnywhere
-              }
+                  BorderSurface {
+                    required property int index
+                    required property var modelData
 
-              Item {
-                width: parent.width
-                implicitHeight: importButtons.implicitHeight
+                    readonly property bool selected: editChooser.selectedIndex === index
 
-                Row {
-                  id: importButtons
-                  anchors.right: parent.right
-                  spacing: Style.space(10)
+                    // Three equal shares of the card, not the fixed 88 the
+                    // two-button ConfirmDialog gets away with — three of
+                    // those overflow this card's width.
+                    width: (editButtonsRow.width - Style.space(10) * 2) / 3
+                    height: Style.space(34)
+                    color: selected ? Util.alpha(Color.foreground, 0.08) : "transparent"
+                    borderSpec: Border.flat(selected
+                      ? Color.accent
+                      : Util.alpha(root.foreground, 0.38), Style.normalBorderWidth)
+                    radius: 0
 
-                  Button {
-                    text: "Cancel"
-                    bordered: true
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    onClicked: root.cancelImport()
-                  }
+                    Text {
+                      anchors.centerIn: parent
+                      text: modelData.label
+                      color: selected ? Color.accent : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
 
-                  Button {
-                    text: root.importReplaces ? "Replace" : "Import"
-                    bordered: true
-                    enabled: root.importAccepted
-                    foreground: root.importAccepted ? root.foreground : root.dim
-                    fontFamily: root.fontFamily
-                    onClicked: root.confirmImport()
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onEntered: editChooser.selectedIndex = index
+                      onClicked: root.confirmEdit(modelData.kind)
+                    }
                   }
                 }
               }
             }
           }
         }
+      }
+
+      // The QR itself is the dialog: no chooser, no confirmation step — the
+      // private-key warning rides under the code. Click anywhere or press
+      // Esc/q to close; the PNG in XDG_RUNTIME_DIR is deleted on close.
+      Item {
+        id: qrDialog
+        anchors.fill: parent
+        visible: wireguard.qrPath !== ""
 
         onVisibleChanged: {
-          if (visible) {
-            Qt.callLater(function() {
-              nameField.forceActiveFocus()
-              nameField.selectAll()
-            })
-          } else {
-            keyCatcher.forceActiveFocus()
+          if (visible) qrDialog.forceActiveFocus()
+          else keyCatcher.forceActiveFocus()
+        }
+        Keys.onPressed: function(event) {
+          if (event.key === Qt.Key_Escape || event.key === Qt.Key_Q
+              || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            wireguard.closeQr()
+            event.accepted = true
+          }
+        }
+
+        Rectangle {
+          anchors.fill: parent
+          color: Util.alpha(Color.background, 0.7)
+
+          MouseArea { anchors.fill: parent; onClicked: wireguard.closeQr() }
+
+          BorderSurface {
+            id: qrCard
+            width: Math.min(parent.width - Style.space(48), Style.space(300))
+            height: qrCard.contentTopInset + qrCard.contentBottomInset + qrColumn.implicitHeight
+            anchors.centerIn: parent
+            color: Color.background
+            borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
+            padding: Style.space(18)
+            radius: Style.cornerRadius
+
+            MouseArea { anchors.fill: parent; onClicked: wireguard.closeQr() }
+
+            Column {
+              id: qrColumn
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.topMargin: qrCard.contentTopInset
+              anchors.leftMargin: qrCard.contentLeftInset
+              anchors.rightMargin: qrCard.contentRightInset
+              spacing: Style.space(10)
+
+              Text {
+                width: parent.width
+                text: wireguard.qrName
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.title
+                elide: Text.ElideMiddle
+                horizontalAlignment: Text.AlignHCenter
+              }
+
+              // White backing behind the PNG: phone cameras want contrast,
+              // and the panel background is dark.
+              Rectangle {
+                width: parent.width
+                height: width
+                color: "white"
+
+                Image {
+                  anchors.fill: parent
+                  anchors.margins: Style.space(6)
+                  source: wireguard.qrPath !== "" ? "file://" + wireguard.qrPath : ""
+                  fillMode: Image.PreserveAspectFit
+                  // Crisp modules beat antialiased mush for a camera.
+                  smooth: false
+                  cache: false
+                }
+              }
+
+              Text {
+                width: parent.width
+                text: "Scan with the WireGuard app. The code holds the private key — this moves the profile; two devices on one key kick each other offline."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
           }
         }
       }
@@ -582,6 +826,124 @@ Panel {
           var profile = root.pendingDelete
           root.pendingDelete = null
           wireguard.deleteConfig(profile)
+        }
+      }
+    }
+  }
+
+  // Modal name prompt over the panel — a card with a single-line field, a
+  // validation hint and Cancel/confirm. The caller owns the validation:
+  // `accepted` gates both the confirm button and Enter.
+  component NamePrompt: Item {
+    id: prompt
+    property string title: ""
+    property string placeholder: ""
+    property string hint: ""
+    property bool accepted: false
+    property string confirmLabel: "OK"
+    property alias value: promptField.text
+    signal confirmed()
+    signal canceled()
+
+    visible: false
+
+    function openWith(text) {
+      promptField.text = String(text)
+      visible = true
+      Qt.callLater(function() {
+        promptField.forceActiveFocus()
+        promptField.selectAll()
+      })
+    }
+
+    function dismiss() {
+      visible = false
+      keyCatcher.forceActiveFocus()
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      color: Util.alpha(Color.background, 0.7)
+
+      MouseArea { anchors.fill: parent; onClicked: prompt.canceled() }
+
+      BorderSurface {
+        id: promptCard
+        width: Math.min(parent.width - Style.space(32), Style.space(340))
+        height: promptCard.contentTopInset + promptCard.contentBottomInset + promptColumn.implicitHeight
+        anchors.centerIn: parent
+        color: Color.background
+        borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
+        padding: Style.space(18)
+        radius: Style.cornerRadius
+
+        MouseArea { anchors.fill: parent; onClicked: {} }
+
+        Column {
+          id: promptColumn
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.top: parent.top
+          anchors.topMargin: promptCard.contentTopInset
+          anchors.leftMargin: promptCard.contentLeftInset
+          anchors.rightMargin: promptCard.contentRightInset
+          spacing: Style.space(10)
+
+          Text {
+            width: parent.width
+            text: prompt.title
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            elide: Text.ElideMiddle
+          }
+
+          TextField {
+            id: promptField
+            width: parent.width
+            placeholderText: prompt.placeholder
+            foreground: root.foreground
+            font.family: root.fontFamily
+            onAccepted: if (prompt.accepted) prompt.confirmed()
+            Keys.onEscapePressed: prompt.canceled()
+          }
+
+          Text {
+            width: parent.width
+            text: prompt.hint
+            color: prompt.accepted ? root.dim : root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WrapAnywhere
+          }
+
+          Item {
+            width: parent.width
+            implicitHeight: promptButtons.implicitHeight
+
+            Row {
+              id: promptButtons
+              anchors.right: parent.right
+              spacing: Style.space(10)
+
+              Button {
+                text: "Cancel"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: prompt.canceled()
+              }
+
+              Button {
+                text: prompt.confirmLabel
+                bordered: true
+                enabled: prompt.accepted
+                foreground: prompt.accepted ? root.foreground : root.dim
+                fontFamily: root.fontFamily
+                onClicked: prompt.confirmed()
+              }
+            }
+          }
         }
       }
     }
@@ -641,7 +1003,13 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: configRow.connected ? "Connected — click to disconnect" : "Click to connect"
+          // Traffic, not health: rate and session totals say the tunnel is
+          // moving bytes, nothing more — an idle tunnel is not a broken one.
+          text: {
+            if (!configRow.connected) return "Click to connect"
+            var line = wireguard.trafficLine(configRow.profile ? configRow.profile.ifname : "")
+            return line !== "" ? line : "Connected — click to disconnect"
+          }
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -651,19 +1019,28 @@ Panel {
 
       PanelActionButton {
         iconText: "󰏫"
-        tooltipText: "Edit config"
         foreground: root.dim
         hoverColor: root.foreground
         fontFamily: root.fontFamily
         enabled: !wireguard.busy
         visible: configRow.hasCursor
         Layout.alignment: Qt.AlignVCenter
-        onClicked: wireguard.editConfig(configRow.profile, "")
+        onClicked: root.requestEdit(configRow.profile)
+      }
+
+      PanelActionButton {
+        iconText: "󰐲"
+        foreground: root.dim
+        hoverColor: root.foreground
+        fontFamily: root.fontFamily
+        enabled: !wireguard.busy
+        visible: configRow.hasCursor
+        Layout.alignment: Qt.AlignVCenter
+        onClicked: wireguard.showQr(configRow.profile)
       }
 
       PanelActionButton {
         iconText: "󰆴"
-        tooltipText: "Delete config"
         foreground: root.dim
         hoverColor: root.urgent
         fontFamily: root.fontFamily
