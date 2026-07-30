@@ -29,22 +29,28 @@ Item {
     return out
   }
   readonly property bool active: activeNames.length > 0
-  // Most recently connected config, persisted across restarts so the
-  // hero toggle reconnects what you actually used last.
-  property string lastConnected: ""
+  // UUID of the most recently connected profile, persisted across restarts
+  // so the hero toggle reconnects what you actually used last. A UUID, not
+  // a name: with duplicate names a name would resolve to the wrong profile.
+  property string lastUuid: ""
   property string actionStatus: ""
   property string lastError: ""
 
   readonly property bool busy: controlProcess.running
   readonly property string statusText: active ? "VPN: " + activeNames.join(" ") : "VPN disconnected"
-  // What toggle() would bring up: last used config if it still exists,
-  // otherwise the first one.
-  readonly property string toggleTarget: {
+  // What toggle() would bring up: the last used profile if it still exists,
+  // otherwise the first one. A pre-UUID state file holds a name, so a name
+  // match is the fallback before giving up on the stored value.
+  readonly property var toggleProfile: {
+    var byName = null
     for (var i = 0; i < profiles.length; i++) {
-      if (profiles[i].name === lastConnected) return lastConnected
+      if (profiles[i].uuid === lastUuid) return profiles[i]
+      if (byName === null && profiles[i].name === lastUuid) byName = profiles[i]
     }
-    return profiles.length > 0 ? profiles[0].name : ""
+    if (byName !== null) return byName
+    return profiles.length > 0 ? profiles[0] : null
   }
+  readonly property string toggleTarget: toggleProfile ? toggleProfile.name : ""
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 10, 2, 3600)
 
@@ -81,6 +87,7 @@ Item {
     var sep = lines.indexOf("---")
     if (sep === -1) {
       lastError = "Failed to read WireGuard status"
+      _pollError = true
       return
     }
     var list = []
@@ -108,18 +115,24 @@ Item {
       var uuid = lines[j].trim()
       if (uuid === "" || byUuid[uuid] === undefined) continue
       byUuid[uuid].active = true
-      if (firstUp === "") firstUp = byUuid[uuid].name
+      if (firstUp === "") firstUp = uuid
     }
     profiles = list
     // Track connects made outside the widget too (nmcli, GUI).
     if (firstUp !== "") rememberLast(firstUp)
-    lastError = ""
+    // A successful poll retracts only its own earlier failure — an error (or
+    // warning) from a control operation must outlive the refresh that every
+    // operation triggers, or it flashes for one poll and vanishes.
+    if (_pollError) {
+      _pollError = false
+      lastError = ""
+    }
   }
 
-  function rememberLast(name) {
-    var value = String(name || "")
-    if (value === "" || value === lastConnected) return
-    lastConnected = value
+  function rememberLast(uuid) {
+    var value = String(uuid || "")
+    if (value === "" || value === lastUuid) return
+    lastUuid = value
     saveProcess.command = ["bash", "-c",
       "mkdir -p \"$1\" && printf '%s' \"$2\" > \"$1/wireguard-last\"",
       "wireguard", stateDir, value]
@@ -129,7 +142,7 @@ Item {
   function connectTo(profile) {
     if (busy || !profile || !profile.uuid) return
     actionStatus = "Connecting " + profile.name + "…"
-    _pendingConnect = String(profile.name)
+    _pendingConnect = String(profile.uuid)
     runControl(["connect", profile.uuid])
   }
 
@@ -153,7 +166,7 @@ Item {
 
   function toggle() {
     if (active) disconnectAll()
-    else if (toggleTarget !== "") connectTo(findByName(toggleTarget))
+    else if (toggleProfile !== null) connectTo(toggleProfile)
   }
 
   // Import: a picked file or pasted text becomes an NM connection profile,
@@ -314,6 +327,9 @@ Item {
 
   property string _controlError: ""
   property string _controlStdin: ""
+  // True while lastError describes a failed status poll, so a successful
+  // poll knows it may clear it.
+  property bool _pollError: false
   property string _pendingConnect: ""
   property string _editUuid: ""
   property string _editName: ""
@@ -335,7 +351,7 @@ Item {
     printErrors: false
     onLoaded: {
       var value = String(text() || "").trim()
-      if (value !== "" && root.lastConnected === "") root.lastConnected = value
+      if (value !== "" && root.lastUuid === "") root.lastUuid = value
     }
   }
 
@@ -383,8 +399,12 @@ Item {
     onExited: function(exitCode) {
       // A failed poll must not read as "disconnected" — keep the last known
       // state and say why it could not be refreshed.
-      if (exitCode === 0) root.applyStatus(statusStdout.text)
-      else root.lastError = root.elide(statusStderr.text || "Failed to read WireGuard status")
+      if (exitCode === 0) {
+        root.applyStatus(statusStdout.text)
+      } else {
+        root.lastError = root.elide(statusStderr.text || "Failed to read WireGuard status")
+        root._pollError = true
+      }
     }
   }
 
@@ -502,9 +522,15 @@ Item {
       onStreamFinished: root._controlError = text
     }
     onExited: function(exitCode) {
-      if (exitCode === 0) {
+      // 5 (import only) = the profile was saved but reconnecting it failed.
+      // That is a success as far as the edit is concerned — reopening the
+      // editor would target the already-deleted old profile — so the retry
+      // state is cleared and only the reason is shown.
+      if (exitCode === 0 || exitCode === 5) {
         if (root._pendingConnect !== "") root.rememberLast(root._pendingConnect)
-        root.lastError = ""
+        root.lastError = exitCode === 5
+          ? root.elide(root._controlError || "Saved, but reconnecting failed")
+          : ""
         root.actionStatus = ""
         root._editRetryUuid = ""
         root._editRetryName = ""

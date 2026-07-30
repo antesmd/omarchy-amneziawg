@@ -27,7 +27,8 @@
 #   import <name> [old-uuid] [file]   build a profile from wg-quick config
 #                               text (stdin, or [file]); replaces [old-uuid],
 #                               keeping its connection.id and interface-name,
-#                               and reconnects if it was active
+#                               and reconnects if it was active. Exit 5 means
+#                               the profile was saved but reconnecting failed.
 #   export <uuid>               print the profile as wg-quick config text
 #   edit <uuid> <name>          zenity editor round-trip (seed text on stdin)
 
@@ -238,12 +239,15 @@ cmd_import() {
   # display name ("Office VPN") while interface-name obeys kernel rules —
   # they are separate properties, and only the interface name is validated.
   # A fresh import has no old profile, so there the name serves as both.
+  # --escape no: -g implies terse mode, which backslash-escapes ':' and '\'
+  # by default even for a single field — the value must come back verbatim,
+  # or the id is written back corrupted.
   local ifname="$name" con_id="$name" old_ifname
   if [ -n "$old_uuid" ]; then
-    con_id="$(nmcli -g connection.id connection show "$old_uuid")" ||
+    con_id="$(nmcli --escape no -g connection.id connection show "$old_uuid")" ||
       die "No such profile: $old_uuid"
     [ -n "$con_id" ] || con_id="$name"
-    old_ifname="$(nmcli -g connection.interface-name connection show "$old_uuid")" || old_ifname=""
+    old_ifname="$(nmcli --escape no -g connection.interface-name connection show "$old_uuid")" || old_ifname=""
     [ -n "$old_ifname" ] && ifname="$old_ifname"
   fi
   [[ "$ifname" =~ ^[A-Za-z0-9_=+.-]{1,15}$ ]] || die "Invalid interface name: $ifname"
@@ -333,12 +337,21 @@ cmd_import() {
       out="$(nmcli connection down "$old_uuid" 2>&1)" ||
         fail "Could not deactivate the old profile: $out"
     fi
-    out="$(nmcli connection delete "$old_uuid" 2>&1)" ||
+    out="$(nmcli connection delete "$old_uuid" 2>&1)" || {
+      # Roll back: the tunnel was only taken down for the swap, so a failed
+      # swap must not leave the VPN silently off.
+      [ "$was_active" = 1 ] && nmcli connection up "$old_uuid" >/dev/null 2>&1
       fail "Could not delete the old profile: $out"
+    }
     if [ "$was_active" = 1 ]; then
-      # The replacement is complete; a failed activation must not delete it.
-      out="$(nmcli connection up "$uuid" 2>&1)" ||
-        die "Profile saved, but reconnecting failed: $out"
+      # The replacement is complete; a failed activation must not delete it,
+      # and must not read as a failed save either — the UI would reopen the
+      # editor against the already-deleted old profile. Exit 5 says "saved,
+      # but not reconnected".
+      out="$(nmcli connection up "$uuid" 2>&1)" || {
+        printf '%s\n' "Saved, but reconnecting failed: $out" >&2
+        exit 5
+      }
     fi
   fi
 }
