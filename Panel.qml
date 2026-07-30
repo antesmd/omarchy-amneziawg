@@ -222,8 +222,9 @@ Panel {
     // The vpn glyph, not the mark: at the bar's 13px the dragon loses its
     // head. The real logo lives in the panel header, where it has room.
     text: "󰖂"
+    // No tooltip on hover: the icon itself is the status display — full
+    // brightness while a tunnel is up, dimmed while disconnected.
     foreground: root.barIconColor
-    tooltipText: wireguard.statusText
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) {
         if (wireguard.active) wireguard.disconnectAll()
