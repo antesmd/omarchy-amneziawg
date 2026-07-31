@@ -1,7 +1,7 @@
 # WireGuard — Omarchy bar widget
 
 Connect, switch, import, edit, rename and QR-export WireGuard tunnels from
-the Omarchy bar — with live traffic and a warning when a tunnel drops
+the [Omarchy](https://github.com/basecamp/omarchy) bar — with live traffic and a warning when a tunnel drops
 behind your back.
 
 ![The WireGuard panel](preview.png)
