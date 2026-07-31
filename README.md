@@ -48,28 +48,6 @@ Plugins land disabled so you can read the code before enabling it — this one
 is three QML files and one shell script. Add `--yes` to any of the commands
 to skip the prompts.
 
-## Migrating from 1.x
-
-Version 1.x drove `wg-quick` via a sudoers rule and kept configs in
-`~/.config/wireguard/`. To migrate:
-
-1. Import each config through the panel (`i`, or
-   `omarchy-shell glafeara.wireguard importConfig ~/.config/wireguard/kz.conf`).
-2. Delete the old sudoers rule — it granted passwordless root and nothing
-   needs it anymore:
-
-   ```bash
-   sudo rm -f /etc/sudoers.d/wireguard-omarchy
-   ```
-
-3. Optionally delete `~/.config/wireguard/*.conf` — after import the
-   private keys live in NetworkManager's root-owned storage, so the copies
-   in your home directory are just leftover secrets.
-
-Tunnels brought up manually with `wg-quick up` are invisible to
-NetworkManager and to this widget; bring them down once and use the widget
-from then on.
-
 ## Using it
 
 **In the bar:** left click opens and closes the panel, right click
@@ -191,8 +169,7 @@ instead — pass a UUID to disambiguate.
   you explicitly delete. Secrets live in NetworkManager's own root-owned
   storage under `/etc/NetworkManager/system-connections/`.
 - `~/.local/state/omarchy/wireguard-last` — the UUID of the last tunnel you
-  connected, so the bar's quick toggle reconnects what you actually used
-  (a file left by 1.x holds a name; both are accepted).
+  connected, so the bar's quick toggle reconnects what you actually used.
 - `$XDG_RUNTIME_DIR/omarchy-wireguard.<uid>.{lock,intent,notified}` —
   the cross-instance lock, the short-lived "this deactivation was ours"
   markers behind the notifications, and the toast cooldown stamp. tmpfs,
