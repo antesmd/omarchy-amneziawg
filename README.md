@@ -67,8 +67,8 @@ header, the `t` key, or the IPC `toggle` command.
 | `t` | toggle the last used tunnel |
 | `i` | import a `.conf` file |
 | `v` | import a config from the clipboard |
-| `e` | edit the selected connection's config |
-| `n` | rename the selected connection |
+| `e` | edit the selected connection's config (closes the panel) |
+| `n` | rename the selected connection (closes the panel) |
 | `q` | show the selected connection as a QR code |
 | `x` | delete the selected connection (asks first) |
 | `r` | refresh |
@@ -77,7 +77,9 @@ header, the `t` key, or the IPC `toggle` command.
 
 The row under the cursor shows three buttons: the pencil asks whether to
 edit the config or the name, the QR square opens the code, the trash can
-deletes. While a tunnel is connected its row shows **traffic** — current
+deletes. Either answer to the pencil closes the panel — the editor and the
+rename prompt are windows of their own, and the panel would sit in front of
+them. While a tunnel is connected its row shows **traffic** — current
 rate and session totals (`↓ 3.0K/s ↑ 14.8K/s · ↓ 2.6M ↑ 1.1M`), read from
 the interface's `/sys` counters while the panel is open. That line is
 activity, not health: WireGuard has no connection state, and an idle tunnel
@@ -101,7 +103,9 @@ WireGuard has no connected/disconnected handshake state to report.
 
 **Renaming** changes the profile's display name (`connection.id`) only —
 spaces are fine, duplicates are refused. The interface name never changes;
-that one obeys kernel rules and belongs to import.
+that one obeys kernel rules and belongs to import. The prompt opens in its
+own window, centred on the screen like the QR code, and the panel closes
+behind it; `Esc` or a click outside cancels.
 
 **QR export** (`q`, or the QR button) renders the profile as a QR code in
 its own window, centred on the screen — the panel closes, so nothing sits
@@ -121,8 +125,9 @@ network — the bar icon turns urgent and one toast says
 several widget instances (one per monitor) coordinate through a lock so
 you get one toast, not one per screen.
 
-**Editing** shows the connection as wg-quick-style text in zenity's text
-view — reconstructed from NetworkManager, secrets included. Saving unchanged
+**Editing** closes the panel and shows the connection as wg-quick-style text
+in zenity's text view — reconstructed from NetworkManager, secrets
+included. Saving unchanged
 text does nothing; saving over a running tunnel rebuilds the profile and
 brings the tunnel back up on it. Text rejected by validation is handed back
 to the editor rather than thrown away.

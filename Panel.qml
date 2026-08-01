@@ -67,7 +67,7 @@ Panel {
   // Rename touches connection.id only — a free-form label, so spaces are
   // fine. Duplicates are refused: every name-based entry point in the
   // widget treats an ambiguous name as an error, so don't let one be made.
-  readonly property string renameClean: renameDialog.value.trim()
+  readonly property string renameClean: renameWindow.value.trim()
   readonly property bool renameDuplicate: renameClean !== ""
     && (pendingRename === null || renameClean !== pendingRename.name)
     && wireguard.countByName(renameClean) > 0
@@ -158,6 +158,7 @@ Panel {
     importKind = ""
     importPayload = ""
     importDialog.dismiss()
+    keyCatcher.forceActiveFocus()
   }
 
   function requestEdit(profile) {
@@ -165,23 +166,38 @@ Panel {
     pendingEdit = profile
   }
 
+  // Either target takes the panel with it: the config goes to a zenity window
+  // that would otherwise open behind a layer surface holding exclusive
+  // keyboard focus, and the name goes to a centred window of its own.
   function confirmEdit(kind) {
     var profile = pendingEdit
     pendingEdit = null
     if (!profile || kind === "") return
-    if (kind === "name") requestRename(profile)
-    else wireguard.editConfig(profile, "")
+    // A refused rename (a profile went away, an operation is running) leaves
+    // nothing on screen — closing then would just lose the list.
+    if (kind === "name") {
+      if (!requestRename(profile)) return
+    } else {
+      wireguard.editConfig(profile, "")
+    }
+    close()
   }
 
+  // Returns whether the prompt opened, so callers know whether the panel has
+  // anything to hand over to.
   function requestRename(profile) {
-    if (wireguard.busy || !profile) return
+    if (wireguard.busy || !profile) return false
+    // Two overlay surfaces with exclusive keyboard focus would fight; the
+    // code the user is no longer looking at loses.
+    if (wireguard.qrVisible) wireguard.closeQr()
     pendingRename = profile
-    renameDialog.openWith(profile.name)
+    renameWindow.openWith(profile.name)
+    return true
   }
 
   function cancelRename() {
     pendingRename = null
-    renameDialog.dismiss()
+    renameWindow.dismiss()
   }
 
   function confirmRename() {
@@ -225,19 +241,20 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  // Closing no longer tears the QR down — it lives in its own window, and
-  // showing one closes this panel, so a teardown here would kill the code
-  // the user just asked for. Opening is the other half of that exclusion:
-  // the QR window is full-screen with exclusive keyboard focus, so a panel
-  // opened underneath it (IPC `open`, or a `pickConfigFile` landing) would
-  // be invisible, unclickable and unfocused until the code went away.
+  // Closing tears down neither the QR nor the rename prompt — both live in
+  // windows of their own, and showing either closes this panel, so a teardown
+  // here would kill the very thing the user just asked for. Opening is the
+  // other half of that exclusion: those windows are full-screen with
+  // exclusive keyboard focus, so a panel opened underneath one (IPC `open`,
+  // or a `pickConfigFile` landing) would be invisible, unclickable and
+  // unfocused until it went away.
   onOpenedChanged: {
     pendingDelete = null
     pendingEdit = null
     cancelImport()
-    cancelRename()
     if (opened) {
       if (wireguard.qrVisible) wireguard.closeQr()
+      cancelRename()
       cursorActive = false
       if (panelFlick) panelFlick.contentY = 0
       wireguard.refresh()
@@ -262,10 +279,13 @@ Panel {
       root.beginImport(kind, payload, suggestedName)
     }
     // The QR window is centred on the screen and takes keyboard focus; the
-    // panel behind it is in the way, so it goes. One handler covers every
-    // entry point — the q key, the row button and IPC.
+    // panel behind it is in the way, so it goes — as does a rename prompt,
+    // which holds the same kind of surface. One handler covers every entry
+    // point — the q key, the row button and IPC.
     function onQrVisibleChanged() {
-      if (wireguard.qrVisible && root.opened) root.close()
+      if (!wireguard.qrVisible) return
+      if (root.opened) root.close()
+      if (root.pendingRename !== null) root.cancelRename()
     }
   }
 
@@ -390,7 +410,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.pendingDelete !== null || root.pendingEdit !== null || importDialog.visible || renameDialog.visible
+      blocked: root.pendingDelete !== null || root.pendingEdit !== null || importDialog.visible
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
@@ -407,11 +427,17 @@ Panel {
         else if (t === "d" || t === "D") wireguard.disconnectAll()
         else if (t === "i" || t === "I") wireguard.pickConfigFile()
         else if (t === "v" || t === "V") wireguard.pasteConfig()
+        // e and n skip the chooser, but not the closing: the panel is as much
+        // in the way of zenity and of the rename window as it is of the QR.
         else if (t === "e" || t === "E") {
-          if (root.cursorActive && root.focusSection === "configs") wireguard.editConfig(root.selectedProfile(), "")
+          if (root.cursorActive && root.focusSection === "configs") {
+            wireguard.editConfig(root.selectedProfile(), "")
+            root.close()
+          }
         }
         else if (t === "n" || t === "N") {
-          if (root.cursorActive && root.focusSection === "configs") root.requestRename(root.selectedProfile())
+          if (root.cursorActive && root.focusSection === "configs"
+              && root.requestRename(root.selectedProfile())) root.close()
         }
         else if (t === "q" || t === "Q") {
           if (root.cursorActive && root.focusSection === "configs") wireguard.showQr(root.selectedProfile())
@@ -587,20 +613,12 @@ Panel {
         hint: root.importHintText
         accepted: root.importAccepted
         confirmLabel: root.importReplaces ? "Replace" : "Import"
+        foreground: root.foreground
+        dim: root.dim
+        urgent: root.urgent
+        fontFamily: root.fontFamily
         onConfirmed: root.confirmImport()
         onCanceled: root.cancelImport()
-      }
-
-      NamePrompt {
-        id: renameDialog
-        anchors.fill: parent
-        title: "Rename " + (root.pendingRename ? root.pendingRename.name : "")
-        placeholder: "Connection name"
-        hint: root.renameHint
-        accepted: root.renameAccepted
-        confirmLabel: "Rename"
-        onConfirmed: root.confirmRename()
-        onCanceled: root.cancelRename()
       }
 
       // One pencil, two targets: the chooser splits "edit" into the config
@@ -622,9 +640,9 @@ Panel {
           if (visible) {
             selectedIndex = 1
             editChooser.forceActiveFocus()
-          } else if (root.pendingRename === null) {
-            // Choosing "Name" hands focus to the rename prompt, not back
-            // to the list.
+          } else {
+            // Harmless when a choice closed the panel: reopening puts the
+            // focus back on the key catcher anyway.
             keyCatcher.forceActiveFocus()
           }
         }
@@ -775,122 +793,25 @@ Panel {
     onCloseRequested: wireguard.closeQr()
   }
 
-  // Modal name prompt over the panel — a card with a single-line field, a
-  // validation hint and Cancel/confirm. The caller owns the validation:
-  // `accepted` gates both the confirm button and Enter.
-  component NamePrompt: Item {
-    id: prompt
-    property string title: ""
-    property string placeholder: ""
-    property string hint: ""
-    property bool accepted: false
-    property string confirmLabel: "OK"
-    property alias value: promptField.text
-    signal confirmed()
-    signal canceled()
-
-    visible: false
-
-    function openWith(text) {
-      promptField.text = String(text)
-      visible = true
-      Qt.callLater(function() {
-        promptField.forceActiveFocus()
-        promptField.selectAll()
-      })
-    }
-
-    function dismiss() {
-      visible = false
-      keyCatcher.forceActiveFocus()
-    }
-
-    Rectangle {
-      anchors.fill: parent
-      color: Util.alpha(Color.background, 0.7)
-
-      MouseArea { anchors.fill: parent; onClicked: prompt.canceled() }
-
-      BorderSurface {
-        id: promptCard
-        width: Math.min(parent.width - Style.space(32), Style.space(340))
-        height: promptCard.contentTopInset + promptCard.contentBottomInset + promptColumn.implicitHeight
-        anchors.centerIn: parent
-        color: Color.background
-        borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
-        padding: Style.space(18)
-        radius: Style.cornerRadius
-
-        MouseArea { anchors.fill: parent; onClicked: {} }
-
-        Column {
-          id: promptColumn
-          anchors.left: parent.left
-          anchors.right: parent.right
-          anchors.top: parent.top
-          anchors.topMargin: promptCard.contentTopInset
-          anchors.leftMargin: promptCard.contentLeftInset
-          anchors.rightMargin: promptCard.contentRightInset
-          spacing: Style.space(10)
-
-          Text {
-            width: parent.width
-            text: prompt.title
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.title
-            elide: Text.ElideMiddle
-          }
-
-          TextField {
-            id: promptField
-            width: parent.width
-            placeholderText: prompt.placeholder
-            foreground: root.foreground
-            font.family: root.fontFamily
-            onAccepted: if (prompt.accepted) prompt.confirmed()
-            Keys.onEscapePressed: prompt.canceled()
-          }
-
-          Text {
-            width: parent.width
-            text: prompt.hint
-            color: prompt.accepted ? root.dim : root.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WrapAnywhere
-          }
-
-          Item {
-            width: parent.width
-            implicitHeight: promptButtons.implicitHeight
-
-            Row {
-              id: promptButtons
-              anchors.right: parent.right
-              spacing: Style.space(10)
-
-              Button {
-                text: "Cancel"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: prompt.canceled()
-              }
-
-              Button {
-                text: prompt.confirmLabel
-                bordered: true
-                enabled: prompt.accepted
-                foreground: prompt.accepted ? root.foreground : root.dim
-                fontFamily: root.fontFamily
-                onClicked: prompt.confirmed()
-              }
-            }
-          }
-        }
-      }
-    }
+  // Screen-centred like the QR, and for the same reason: the popup is pinned
+  // under its bar icon, so a prompt inside it opens in a corner with a field
+  // squeezed to the column's width. Opening it closes the panel; closing it
+  // leaves the panel closed.
+  RenameWindow {
+    id: renameWindow
+    anchorItem: button
+    open: root.pendingRename !== null
+    title: "Rename " + (root.pendingRename ? root.pendingRename.name : "")
+    placeholder: "Connection name"
+    hint: root.renameHint
+    accepted: root.renameAccepted
+    confirmLabel: "Rename"
+    foreground: root.foreground
+    dim: root.dim
+    urgent: root.urgent
+    fontFamily: root.fontFamily
+    onConfirmed: root.confirmRename()
+    onCanceled: root.cancelRename()
   }
 
   component ConfigRow: CursorSurface {
