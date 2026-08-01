@@ -413,8 +413,20 @@ Item {
     exportProcess.running = true
   }
 
+  // Returns "" when a code is on its way, or why nothing will appear.
   function showQr(profile) {
-    if (!profile || !profile.uuid || qrProcess.running) return
+    if (!profile || !profile.uuid) return "no such profile"
+    if (qrProcess.running) {
+      // closeQr retracts a render but lets it finish, so the process can be
+      // busy with nothing on screen. Say so there rather than dropping the
+      // request silently; while a wanted render is still running the window
+      // already says what it is doing, so leave it alone.
+      if (!_qrWanted) {
+        qrName = String(profile.name)
+        qrError = "Another QR code is still rendering — try again in a moment"
+      }
+      return "another QR code is still rendering"
+    }
     closeQr()
     _qrWanted = true
     // Named now, not on exit: the window opens on the request, so its title
@@ -423,6 +435,7 @@ Item {
     qrLoading = true
     qrProcess.command = ["bash", backendPath, "qr-png", profile.uuid]
     qrProcess.running = true
+    return ""
   }
 
   function closeQr() {

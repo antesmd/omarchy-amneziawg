@@ -30,6 +30,10 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
       window lands on the screen whose bar was used.
 - [ ] Without `qrencode` the window still opens and shows the install hint;
       the bar icon does not turn urgent.
+- [ ] Two `qr` calls back to back: the second answers
+      `error: another QR code is still rendering`, never a false `ok`.
+- [ ] Opening the panel while a code is up (IPC `open`, or an import
+      landing) closes the code rather than hiding the panel beneath it.
 - [ ] Scanning with the phone's WireGuard app imports a working tunnel.
 - [ ] `omarchy-shell glafeara.wireguard exportConfig <name> <path>` writes a
       0600 file that re-imports losslessly.

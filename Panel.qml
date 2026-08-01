@@ -225,15 +225,19 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  // The QR is deliberately absent here: it lives in its own window now, and
-  // showing one closes this panel — tearing it down on close would kill the
-  // code the user just asked for. Its PNG belongs to qrWindow, not to us.
+  // Closing no longer tears the QR down — it lives in its own window, and
+  // showing one closes this panel, so a teardown here would kill the code
+  // the user just asked for. Opening is the other half of that exclusion:
+  // the QR window is full-screen with exclusive keyboard focus, so a panel
+  // opened underneath it (IPC `open`, or a `pickConfigFile` landing) would
+  // be invisible, unclickable and unfocused until the code went away.
   onOpenedChanged: {
     pendingDelete = null
     pendingEdit = null
     cancelImport()
     cancelRename()
     if (opened) {
+      if (wireguard.qrVisible) wireguard.closeQr()
       cursorActive = false
       if (panelFlick) panelFlick.contentY = 0
       wireguard.refresh()
@@ -342,8 +346,10 @@ Panel {
         if (n > 1) return "error: ambiguous name: " + target + " — use a UUID: " + wireguard.uuidsForName(target).join(" ")
         profile = wireguard.findByName(target)
       }
-      wireguard.showQr(profile)
-      return "ok"
+      // "ok" has to mean a code is coming: with no panel in the way, the
+      // return value is the only thing a headless caller gets back.
+      var problem = wireguard.showQr(profile)
+      return problem === "" ? "ok" : "error: " + problem
     }
   }
 

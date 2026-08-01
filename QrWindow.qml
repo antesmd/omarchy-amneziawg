@@ -166,8 +166,12 @@ PanelWindow {
             anchors.margins: root.codeInset
             source: root.path !== "" ? "file://" + root.path : ""
             fillMode: Image.PreserveAspectFit
-            // Crisp modules beat antialiased mush for a camera.
-            smooth: false
+            // Crisp modules beat antialiased mush for a camera — but only
+            // while we are magnifying. A code too big for the screen gets
+            // scaled down by a fraction, and nearest-neighbour then drops
+            // and doubles whole module columns, which no scanner survives;
+            // filtering is the lesser evil there.
+            smooth: width < implicitWidth
             cache: false
           }
         }
