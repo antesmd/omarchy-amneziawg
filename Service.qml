@@ -374,6 +374,12 @@ Item {
   // `seedText` reopens the editor on text that was rejected rather than on
   // what is stored, so a refused save costs a keystroke to fix instead of
   // the whole edit.
+  //
+  // Emitted when the handoff produced no editor at all — the caller may have
+  // closed the panel to get out of zenity's way, and lastError has nowhere
+  // to be read. A cancelled or unchanged edit is not a failure.
+  signal editFailed(string reason)
+
   function editConfig(profile, seedText) {
     if (!profile || !profile.uuid || editProcess.running) return
     _editUuid = String(profile.uuid)
@@ -772,11 +778,15 @@ Item {
       root.actionStatus = ""
       if (exitCode === 2) {
         root.lastError = "zenity is not installed"
+        root.editFailed(root.lastError)
         return
       }
       // 3 = Cancel, 4 = nothing changed; neither is worth a message.
       if (exitCode !== 0) {
-        if (exitCode !== 3 && exitCode !== 4) root.lastError = "Could not open " + name
+        if (exitCode !== 3 && exitCode !== 4) {
+          root.lastError = "Could not open " + name
+          root.editFailed(root.lastError)
+        }
         return
       }
       var text = String(editStdout.text || "")

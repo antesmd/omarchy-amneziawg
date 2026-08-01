@@ -50,7 +50,22 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
 
 ## Editing
 
-- [ ] Pencil → Config edits and saves over a running tunnel; the tunnel
-      comes back up on the new profile.
-- [ ] Pencil → Name renames without touching the interface; duplicates are
-      refused.
+- [ ] Pencil → Config closes the panel, and zenity comes up focused rather
+      than behind the popup; the save goes over a running tunnel and the
+      tunnel comes back up on the new profile.
+- [ ] Pencil → Name closes the panel and opens the prompt centred on screen,
+      field focused with the name selected. Renames without touching the
+      interface; duplicates are refused. `Esc` or a click outside cancels,
+      and the panel stays closed either way.
+- [ ] `e` and `n` on the selected row do the same as the pencil's two
+      answers, panel closing included.
+- [ ] With `zenity` uninstalled, Config reopens the panel on "zenity is not
+      installed" rather than leaving a closed popup and an urgent bar icon.
+      Cancelling the editor, or saving unchanged text, does **not** reopen
+      it. `omarchy-shell glafeara.wireguard edit <name>` with the panel
+      closed stays headless either way.
+- [ ] Opening the panel while the rename prompt is up (IPC `open`, or an
+      import landing) closes the prompt rather than hiding the panel beneath
+      it; `qr` while it is up does the same.
+- [ ] The import prompt (`i` / `v`) still lives inside the panel and gets the
+      focus back on cancel.
