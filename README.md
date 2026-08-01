@@ -73,7 +73,7 @@ header, the `t` key, or the IPC `toggle` command.
 | `Esc` | close |
 
 The row under the cursor shows three buttons: the pencil asks whether to
-edit the config or the name, the QR square shows the code, the trash can
+edit the config or the name, the QR square opens the code, the trash can
 deletes. While a tunnel is connected its row shows **traffic** — current
 rate and session totals (`↓ 3.0K/s ↑ 14.8K/s · ↓ 2.6M ↑ 1.1M`), read from
 the interface's `/sys` counters while the panel is open. That line is
@@ -100,10 +100,12 @@ WireGuard has no connected/disconnected handshake state to report.
 spaces are fine, duplicates are refused. The interface name never changes;
 that one obeys kernel rules and belongs to import.
 
-**QR export** (`q`, or the QR button) renders the profile as a QR code
-right in the panel — scan it with the phone's WireGuard app. The PNG lives
-in `XDG_RUNTIME_DIR` (tmpfs, mode 0600) and is deleted the moment the
-dialog closes. Mind what the code contains: **the private key**. Scanning
+**QR export** (`q`, or the QR button) renders the profile as a QR code in
+its own window, centred on the screen — the panel closes, so nothing sits
+between the code and the phone's camera. `Esc`, `q` or a click outside
+closes it. The PNG lives in `XDG_RUNTIME_DIR` (tmpfs, mode 0600) and is
+deleted the moment the window closes. Mind what the code contains: **the
+private key**. Scanning
 it *moves* the profile, it does not add a device — a WireGuard server
 tracks one endpoint per key, so two devices sharing a profile kick each
 other offline on every handshake. File export exists too, IPC-only:
@@ -156,7 +158,7 @@ omarchy-shell glafeara.wireguard importPick              # opens the file picker
 omarchy-shell glafeara.wireguard importPaste             # imports from the clipboard
 omarchy-shell glafeara.wireguard rename kz kz-home       # display name only
 omarchy-shell glafeara.wireguard exportConfig kz ~/kz.conf   # 0600, private key inside
-omarchy-shell glafeara.wireguard qr kz                   # QR dialog in the panel
+omarchy-shell glafeara.wireguard qr kz                   # QR window, centred on screen
 ```
 
 Name-based commands refuse an ambiguous name and list the matching UUIDs
@@ -174,7 +176,7 @@ instead — pass a UUID to disambiguate.
   the cross-instance lock, the short-lived "this deactivation was ours"
   markers behind the notifications, and the toast cooldown stamp. tmpfs,
   gone at reboot.
-- `$XDG_RUNTIME_DIR/wg-qr.*.png` — the QR image while its dialog is open;
+- `$XDG_RUNTIME_DIR/wg-qr.*.png` — the QR image while its window is open;
   deleted on close.
 - `/sys/class/net/<iface>/statistics/{rx,tx}_bytes` — read-only, for the
   traffic line.

@@ -22,8 +22,18 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
 
 ## Export / QR
 
-- [ ] `q` on a profile renders the QR in the panel (needs `qrencode`);
-      closing deletes `$XDG_RUNTIME_DIR/wg-qr.*.png`.
+- [ ] `q` on a profile (or the QR button) opens the code centred on screen
+      and closes the panel; `Esc`, `q` or a click outside closes it and
+      deletes `$XDG_RUNTIME_DIR/wg-qr.*.png`. The panel stays closed.
+- [ ] `omarchy-shell glafeara.wireguard qr <name>` with the panel closed
+      opens the window without flashing the panel; on a second monitor the
+      window lands on the screen whose bar was used.
+- [ ] Without `qrencode` the window still opens and shows the install hint;
+      the bar icon does not turn urgent.
+- [ ] Two `qr` calls back to back: the second answers
+      `error: another QR code is still rendering`, never a false `ok`.
+- [ ] Opening the panel while a code is up (IPC `open`, or an import
+      landing) closes the code rather than hiding the panel beneath it.
 - [ ] Scanning with the phone's WireGuard app imports a working tunnel.
 - [ ] `omarchy-shell glafeara.wireguard exportConfig <name> <path>` writes a
       0600 file that re-imports losslessly.
