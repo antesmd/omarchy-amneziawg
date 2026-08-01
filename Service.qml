@@ -391,9 +391,16 @@ Item {
   // Export hands the config — private key included — out of NetworkManager's
   // storage. File export is IPC-only (an explicit path in argv is already a
   // deliberate act); the QR is rendered by the backend into XDG_RUNTIME_DIR
-  // and displayed inline by the panel, which owns the PNG until closeQr.
+  // and displayed by the centred QR window, which owns the PNG until closeQr.
   property string qrPath: ""
   property string qrName: ""
+  // The QR window is the only surface a QR request reports through — the
+  // panel closes the moment one starts, so a render failure has to be
+  // visible there rather than in lastError (which would also leave the bar
+  // icon urgent for a problem the user has already dismissed).
+  property bool qrLoading: false
+  property string qrError: ""
+  readonly property bool qrVisible: qrLoading || qrPath !== "" || qrError !== ""
 
   function exportToPath(profile, path) {
     if (!profile || !profile.uuid || exportProcess.running) return
@@ -410,17 +417,20 @@ Item {
     if (!profile || !profile.uuid || qrProcess.running) return
     closeQr()
     _qrWanted = true
-    _qrPendingName = String(profile.name)
-    lastError = ""
-    actionStatus = "QR code for " + profile.name + "…"
+    // Named now, not on exit: the window opens on the request, so its title
+    // has to read right while the code is still being rendered.
+    qrName = String(profile.name)
+    qrLoading = true
     qrProcess.command = ["bash", backendPath, "qr-png", profile.uuid]
     qrProcess.running = true
   }
 
   function closeQr() {
-    // Also retracts a request still in flight: the panel may close while
+    // Also retracts a request still in flight: the window may close while
     // qr-png runs, and a PNG nobody is waiting for must not linger — the
     // process handler deletes an unwanted result instead of keeping it.
+    // The process itself is left to finish: killing qrencode mid-write would
+    // strand the file mktemp already created.
     _qrWanted = false
     if (qrPath !== "") {
       qrCleanupProcess.command = ["rm", "-f", "--", qrPath]
@@ -428,6 +438,8 @@ Item {
     }
     qrPath = ""
     qrName = ""
+    qrLoading = false
+    qrError = ""
   }
 
   function _flushDrops() {
@@ -591,7 +603,6 @@ Item {
   property bool _pollError: false
   property string _pendingConnect: ""
   property string _exportDest: ""
-  property string _qrPendingName: ""
   // uuid -> name of the profiles active at the previous status poll.
   property var _prevActive: ({})
   property string _notifyDropName: ""
@@ -604,8 +615,8 @@ Item {
   property var _markInFlight: []
   // Epoch seconds of the moment the running status poll was requested.
   property double _statusStartedAt: 0
-  // False once the QR dialog (or the panel) closed — a result arriving
-  // afterwards is deleted, not displayed.
+  // False once the QR window closed — a result arriving afterwards is
+  // deleted, not displayed.
   property bool _qrWanted: false
 
   // Each argument is "uuid:observed-epoch"; UUIDs contain no colons. Every
@@ -835,27 +846,22 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
-      root.actionStatus = ""
-      var name = root._qrPendingName
-      root._qrPendingName = ""
-      if (exitCode === 0) {
-        var path = String(qrStdout.text || "").trim()
-        if (path === "") {
-          root.lastError = "Could not render the QR code"
-          return
-        }
-        // The dialog (or panel) closed while we rendered: the result is
-        // key material nobody is looking at — delete it immediately.
-        if (!root._qrWanted) {
+      root.qrLoading = false
+      var path = exitCode === 0 ? String(qrStdout.text || "").trim() : ""
+      // The window closed while we rendered: nobody is waiting for this, and
+      // a successful result is key material — delete it and say nothing.
+      if (!root._qrWanted) {
+        if (path !== "") {
           qrCleanupProcess.command = ["rm", "-f", "--", path]
           qrCleanupProcess.running = true
-          return
         }
+        return
+      }
+      if (exitCode === 0 && path !== "") {
         root.qrPath = path
-        root.qrName = name
       } else {
         // 2 = qrencode missing, with the install hint on stderr.
-        root.lastError = root.elide(qrStderr.text || "Could not render the QR code")
+        root.qrError = root.elide(qrStderr.text || "Could not render the QR code")
       }
     }
   }

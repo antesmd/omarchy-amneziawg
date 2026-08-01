@@ -225,10 +225,12 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  // The QR is deliberately absent here: it lives in its own window now, and
+  // showing one closes this panel — tearing it down on close would kill the
+  // code the user just asked for. Its PNG belongs to qrWindow, not to us.
   onOpenedChanged: {
     pendingDelete = null
     pendingEdit = null
-    wireguard.closeQr()
     cancelImport()
     cancelRename()
     if (opened) {
@@ -254,6 +256,12 @@ Panel {
     function onImportReady(kind, payload, suggestedName) {
       if (!root.opened) root.open()
       root.beginImport(kind, payload, suggestedName)
+    }
+    // The QR window is centred on the screen and takes keyboard focus; the
+    // panel behind it is in the way, so it goes. One handler covers every
+    // entry point — the q key, the row button and IPC.
+    function onQrVisibleChanged() {
+      if (wireguard.qrVisible && root.opened) root.close()
     }
   }
 
@@ -324,7 +332,8 @@ Panel {
       wireguard.exportToPath(profile, path)
       return "ok"
     }
-    // The QR dialog lives inside the panel, so showing it implies opening.
+    // The QR has its own window, so this never touches the panel — a
+    // headless caller gets the code centred on screen and nothing else.
     function qr(target: string): string {
       var profile = wireguard.findByUuid(target)
       if (!profile) {
@@ -333,7 +342,6 @@ Panel {
         if (n > 1) return "error: ambiguous name: " + target + " — use a UUID: " + wireguard.uuidsForName(target).join(" ")
         profile = wireguard.findByName(target)
       }
-      root.open()
       wireguard.showQr(profile)
       return "ok"
     }
@@ -376,7 +384,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      blocked: root.pendingDelete !== null || root.pendingEdit !== null || qrDialog.visible || importDialog.visible || renameDialog.visible
+      blocked: root.pendingDelete !== null || root.pendingEdit !== null || importDialog.visible || renameDialog.visible
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
         root.moveCursor(dx, dy)
@@ -715,95 +723,6 @@ Panel {
         }
       }
 
-      // The QR itself is the dialog: no chooser, no confirmation step — the
-      // private-key warning rides under the code. Click anywhere or press
-      // Esc/q to close; the PNG in XDG_RUNTIME_DIR is deleted on close.
-      Item {
-        id: qrDialog
-        anchors.fill: parent
-        visible: wireguard.qrPath !== ""
-
-        onVisibleChanged: {
-          if (visible) qrDialog.forceActiveFocus()
-          else keyCatcher.forceActiveFocus()
-        }
-        Keys.onPressed: function(event) {
-          if (event.key === Qt.Key_Escape || event.key === Qt.Key_Q
-              || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-            wireguard.closeQr()
-            event.accepted = true
-          }
-        }
-
-        Rectangle {
-          anchors.fill: parent
-          color: Util.alpha(Color.background, 0.7)
-
-          MouseArea { anchors.fill: parent; onClicked: wireguard.closeQr() }
-
-          BorderSurface {
-            id: qrCard
-            width: Math.min(parent.width - Style.space(48), Style.space(300))
-            height: qrCard.contentTopInset + qrCard.contentBottomInset + qrColumn.implicitHeight
-            anchors.centerIn: parent
-            color: Color.background
-            borderSpec: Border.flat(Color.accent, Style.normalBorderWidth)
-            padding: Style.space(18)
-            radius: Style.cornerRadius
-
-            MouseArea { anchors.fill: parent; onClicked: wireguard.closeQr() }
-
-            Column {
-              id: qrColumn
-              anchors.top: parent.top
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.topMargin: qrCard.contentTopInset
-              anchors.leftMargin: qrCard.contentLeftInset
-              anchors.rightMargin: qrCard.contentRightInset
-              spacing: Style.space(10)
-
-              Text {
-                width: parent.width
-                text: wireguard.qrName
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-                elide: Text.ElideMiddle
-                horizontalAlignment: Text.AlignHCenter
-              }
-
-              // White backing behind the PNG: phone cameras want contrast,
-              // and the panel background is dark.
-              Rectangle {
-                width: parent.width
-                height: width
-                color: "white"
-
-                Image {
-                  anchors.fill: parent
-                  anchors.margins: Style.space(6)
-                  source: wireguard.qrPath !== "" ? "file://" + wireguard.qrPath : ""
-                  fillMode: Image.PreserveAspectFit
-                  // Crisp modules beat antialiased mush for a camera.
-                  smooth: false
-                  cache: false
-                }
-              }
-
-              Text {
-                width: parent.width
-                text: "Scan with the WireGuard app. The code holds the private key — this moves the profile; two devices on one key kick each other offline."
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-            }
-          }
-        }
-      }
-
       ConfirmDialog {
         id: deleteDialog
         anchors.fill: parent
@@ -829,6 +748,24 @@ Panel {
         }
       }
     }
+  }
+
+  // Screen-centred, not panel-bound: a WireGuard config makes a far denser
+  // code than the popup can show at a scannable size. Closing it deletes
+  // the PNG in XDG_RUNTIME_DIR.
+  QrWindow {
+    id: qrWindow
+    anchorItem: button
+    open: wireguard.qrVisible
+    name: wireguard.qrName
+    path: wireguard.qrPath
+    loading: wireguard.qrLoading
+    error: wireguard.qrError
+    foreground: root.foreground
+    dim: root.dim
+    urgent: root.urgent
+    fontFamily: root.fontFamily
+    onCloseRequested: wireguard.closeQr()
   }
 
   // Modal name prompt over the panel — a card with a single-line field, a
