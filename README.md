@@ -1,10 +1,13 @@
-# WireGuard — Omarchy bar widget
+# Omawire — WireGuard tunnels in the Omarchy bar
 
 Connect, switch, import, edit, rename and QR-export WireGuard tunnels from
 the [Omarchy](https://github.com/basecamp/omarchy) bar — with live traffic and a warning when a tunnel drops
 behind your back.
 
-![The WireGuard panel](preview.png)
+Omawire is an unofficial third-party widget. It is not affiliated with,
+endorsed by, or connected to the WireGuard project.
+
+![The Omawire panel](preview.png)
 
 Tunnels are NetworkManager connection profiles. The widget lists every
 WireGuard profile NetworkManager knows about, and importing a `.conf` file
@@ -216,3 +219,13 @@ rm -f ~/.local/state/omarchy/wireguard-last
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Trademarks
+
+"WireGuard" and the "WireGuard" logo are registered trademarks of
+Jason A. Donenfeld. See [wireguard.com](https://www.wireguard.com/). Omawire
+is an independent third-party widget: it uses the name only to describe
+which tunnels it manages, carries none of the project's branding, and is
+neither affiliated with nor endorsed by the WireGuard project. The MIT
+licence above covers this widget's own code and grants no rights in anyone
+else's trademarks.
