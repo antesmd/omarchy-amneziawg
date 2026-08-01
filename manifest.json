@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "glafeara.wireguard",
   "name": "WireGuard",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": "glafeara",
   "license": "MIT",
   "description": "WireGuard status, transactional tunnel switching, import, rename, QR export, live traffic and drop notifications in the Omarchy bar.",
