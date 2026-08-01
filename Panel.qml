@@ -357,8 +357,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // The vpn glyph, not the mark: at the bar's 13px the dragon loses its
-    // head. The real logo lives in the panel header, where it has room.
+    // The generic vpn glyph — the same one the panel header uses at
+    // display size.
     text: "󰖂"
     // No tooltip on hover: the icon itself is the status display — full
     // brightness while a tunnel is up, dimmed while disconnected.
@@ -446,18 +446,19 @@ Panel {
             PanelHero {
               id: hero
               width: parent.width
-              title: "WireGuard"
+              title: "Omawire"
               meta: wireguard.active ? "Connected: " + wireguard.activeNames.join(", ") : "Disconnected"
               foreground: root.foreground
               fontFamily: root.fontFamily
               iconOpacity: wireguard.active ? 1.0 : 0.5
-              // The real mark rather than a glyph: at display size the
-              // dragon actually reads. The bar keeps the vpn glyph, where
-              // 13px would reduce this to a blob.
+              // The bar's vpn glyph, scaled up — the widget carries no
+              // WireGuard branding of its own.
               iconComponent: Component {
-                WireGuardIcon {
-                  iconSize: Style.font.display
+                Text {
+                  text: "󰖂"
                   color: root.iconColor
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.display
                 }
               }
 

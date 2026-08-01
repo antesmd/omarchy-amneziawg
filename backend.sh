@@ -151,7 +151,7 @@ cmd_notify_drop() {
   fi
   printf '%s' "$now" > "$f" 2>/dev/null || true
   command -v notify-send >/dev/null 2>&1 || exit 0
-  notify-send -a WireGuard "WireGuard" "Profile $name was deactivated" 2>/dev/null || true
+  notify-send -a Omawire "Omawire" "Profile $name was deactivated" 2>/dev/null || true
   exit 0
 }
 
