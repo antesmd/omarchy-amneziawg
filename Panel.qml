@@ -26,6 +26,10 @@ Panel {
   // Profile whose pencil was clicked — the chooser asks whether to edit
   // the config or the name; keyboard users go straight there with e / n.
   property var pendingEdit: null
+  // Set when the panel closed to get out of the editor's way. The panel is
+  // where lastError is read, so a handoff that produced no editor has to
+  // bring it back; an IPC edit never sets this and stays headless.
+  property bool editHandedOff: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -178,9 +182,14 @@ Panel {
     if (kind === "name") {
       if (!requestRename(profile)) return
     } else {
-      wireguard.editConfig(profile, "")
+      handOffToEditor(profile)
     }
     close()
+  }
+
+  function handOffToEditor(profile) {
+    editHandedOff = true
+    wireguard.editConfig(profile, "")
   }
 
   // Returns whether the prompt opened, so callers know whether the panel has
@@ -255,6 +264,9 @@ Panel {
     if (opened) {
       if (wireguard.qrVisible) wireguard.closeQr()
       cancelRename()
+      // The error surface is back on screen; whatever happens to the editor
+      // now needs no rescue.
+      editHandedOff = false
       cursorActive = false
       if (panelFlick) panelFlick.contentY = 0
       wireguard.refresh()
@@ -286,6 +298,14 @@ Panel {
       if (!wireguard.qrVisible) return
       if (root.opened) root.close()
       if (root.pendingRename !== null) root.cancelRename()
+    }
+    // The panel stepped aside for an editor that never appeared — and it is
+    // the only place lastError is read, so it comes back to say why. Cancel
+    // and no-change do not reach this: they are not failures.
+    function onEditFailed(reason) {
+      if (!root.editHandedOff) return
+      root.editHandedOff = false
+      if (!root.opened) root.open()
     }
   }
 
@@ -431,7 +451,7 @@ Panel {
         // in the way of zenity and of the rename window as it is of the QR.
         else if (t === "e" || t === "E") {
           if (root.cursorActive && root.focusSection === "configs") {
-            wireguard.editConfig(root.selectedProfile(), "")
+            root.handOffToEditor(root.selectedProfile())
             root.close()
           }
         }

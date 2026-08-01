@@ -59,6 +59,11 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
       and the panel stays closed either way.
 - [ ] `e` and `n` on the selected row do the same as the pencil's two
       answers, panel closing included.
+- [ ] With `zenity` uninstalled, Config reopens the panel on "zenity is not
+      installed" rather than leaving a closed popup and an urgent bar icon.
+      Cancelling the editor, or saving unchanged text, does **not** reopen
+      it. `omarchy-shell glafeara.wireguard edit <name>` with the panel
+      closed stays headless either way.
 - [ ] Opening the panel while the rename prompt is up (IPC `open`, or an
       import landing) closes the prompt rather than hiding the panel beneath
       it; `qr` while it is up does the same.
