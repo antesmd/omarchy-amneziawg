@@ -576,8 +576,12 @@ Panel {
                     tooltipText: "Show " + wireguard.primaryName + " as a QR code (q)"
                     visible: wireguard.active
                     anchors.verticalCenter: parent.verticalCenter
-                    foreground: Qt.darker(hero.foreground, 1.55)
-                    hoverColor: hero.foreground
+                    // Full brightness at rest, like every other hero control:
+                    // dimming until hover is for the row actions, which are
+                    // many and would otherwise shout over the list. This one
+                    // is alone beside the switch and reads as disabled when
+                    // it is merely unhovered. Hover then adds only its fill.
+                    foreground: hero.foreground
                     fontFamily: hero.fontFamily
                     // A hero action, not a row action: the same size the
                     // network panel gives the glyph it parks here, rather
