@@ -20,6 +20,9 @@
 #
 # Commands:
 #   status                      list connections + active wireguard UUIDs
+#   details <uuid> [ifname]     key=value facts for the detail grid (tunnel
+#                               address, peer endpoint, allowed IPs, DNS,
+#                               MTU, peer count). Reads no secrets.
 #   connect <uuid>              transactional exclusive switch. Exit 0: only
 #                               the target is active. Exit 20: the switch
 #                               failed and the previously active tunnels were
@@ -200,6 +203,67 @@ cmd_status() {
   [ -n "$actives" ] && printf '%s\n' "$actives"
   echo ---
   printf '%s' "$ifnames"
+}
+
+# Read-only facts about one profile for the panel's detail grid: the tunnel
+# address, the peer endpoint, what it routes and what it resolves through.
+# nmcli runs *without* -s, so no secret is ever read, let alone printed —
+# this is the one query that runs on a timer while the panel is open.
+# A live interface wins over the stored profile: the kernel knows what the
+# tunnel actually got, the profile only what was asked for.
+cmd_details() {
+  local uuid="$1" ifname="${2:-}"
+  local raw line key value live
+  local addr4="" addr6="" dns4="" dns6="" peers="" mtu=""
+  raw="$(nmcli -t connection show "$uuid")" || exit 1
+  while IFS= read -r line; do
+    key="${line%%:*}"
+    value="$(unescape "${line#*:}")"
+    case "$key" in
+      ipv4.addresses) addr4="$value" ;;
+      ipv6.addresses) addr6="$value" ;;
+      ipv4.dns) dns4="$value" ;;
+      ipv6.dns) dns6="$value" ;;
+      wireguard.mtu) [ "$value" != 0 ] && mtu="$value" ;;
+      wireguard.peers) peers="$value" ;;
+    esac
+  done <<< "$raw"
+
+  if [ -n "$ifname" ] && [ -d "/sys/class/net/$ifname" ]; then
+    live="$(ip -o -4 addr show dev "$ifname" 2>/dev/null | awk '{print $4; exit}')"
+    [ -n "$live" ] && addr4="$live"
+    live="$(ip -o -6 addr show dev "$ifname" scope global 2>/dev/null | awk '{print $4; exit}')"
+    [ -n "$live" ] && addr6="$live"
+    live="$(cat "/sys/class/net/$ifname/mtu" 2>/dev/null)" && [ -n "$live" ] && mtu="$live"
+  fi
+
+  # Only the first peer is described: the grid has one endpoint line, and a
+  # multi-peer profile is a site-to-site setup the count alone can flag.
+  local chunk token count=0 endpoint="" allowed=""
+  while IFS= read -r chunk; do
+    chunk="$(trim "$chunk")"
+    [ -z "$chunk" ] && continue
+    count=$((count + 1))
+    [ "$count" -gt 1 ] && continue
+    # The leading public key ends in "=" but matches neither case arm, so it
+    # needs no special handling here.
+    for token in $chunk; do
+      case "${token%%=*}" in
+        endpoint) endpoint="${token#*=}" ;;
+        allowed-ips) allowed="${token#*=}"; allowed="${allowed//;/, }" ;;
+      esac
+    done
+  done <<< "${peers//, /$'\n'}"
+
+  local dns="$dns4"
+  [ -n "$dns6" ] && dns="${dns:+$dns,}$dns6"
+  printf 'ip=%s\n' "${addr4%%,*}"
+  printf 'ip6=%s\n' "${addr6%%,*}"
+  printf 'endpoint=%s\n' "$endpoint"
+  printf 'allowed=%s\n' "$allowed"
+  printf 'dns=%s\n' "${dns//,/, }"
+  printf 'mtu=%s\n' "$mtu"
+  printf 'peers=%s\n' "$count"
 }
 
 # Transactional exclusive switch. The old tunnel must not be lost to a
@@ -728,6 +792,9 @@ cmd_edit() {
 # user cares to type, and the save that follows goes through import anyway.
 case "${1:-}" in
   status) cmd_status ;;
+  # Read-only, so no lock: it never touches NetworkManager state, and the
+  # panel polls it while a mutating operation may be running.
+  details) cmd_details "$2" "${3:-}" ;;
   connect) lock; cmd_connect "$2" ;;
   down) lock; cmd_down "$2" ;;
   down-all) lock; cmd_down_all ;;
@@ -743,5 +810,5 @@ case "${1:-}" in
   export-file) cmd_export_file "$2" "$3" ;;
   qr-png) cmd_qr_png "$2" ;;
   edit) cmd_edit "$2" "$3" ;;
-  *) die "Usage: backend.sh status|connect|down|down-all|delete|rename|import|export|export-file|qr-png|edit ..." ;;
+  *) die "Usage: backend.sh status|details|connect|down|down-all|delete|rename|import|export|export-file|qr-png|edit ..." ;;
 esac

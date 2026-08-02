@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
@@ -82,6 +83,30 @@ Panel {
       ? "A profile named " + renameClean + " already exists"
       : "Display name only — the interface name does not change")
 
+  // The list re-sorts the moment a tunnel comes up — active first — so the
+  // cursor tracks the profile it was on rather than the slot it held. Without
+  // this, connecting the third row would move that row to the top and leave
+  // the cursor on whatever slid into third place, one Enter away from
+  // switching a tunnel nobody pointed at.
+  property string cursorUuid: ""
+
+  function rememberCursor() {
+    var profile = selectedProfile()
+    cursorUuid = profile ? String(profile.uuid) : ""
+  }
+
+  function restoreCursor() {
+    if (focusSection === "configs" && cursorUuid !== "") {
+      for (var i = 0; i < wireguard.profiles.length; i++) {
+        if (wireguard.profiles[i].uuid === cursorUuid) {
+          configIndex = i
+          break
+        }
+      }
+    }
+    ensureCursor()
+  }
+
   function ensureCursor() {
     if (wireguard.profiles.length === 0) {
       focusSection = "header"
@@ -91,6 +116,10 @@ Panel {
     if (focusSection !== "configs" && focusSection !== "header") focusSection = "configs"
     if (configIndex >= wireguard.profiles.length) configIndex = Math.max(0, wireguard.profiles.length - 1)
     if (configIndex < 0) configIndex = 0
+    // Whatever the cursor ended up on is what it should follow next time —
+    // a clamp that lands on a different profile must not keep chasing the
+    // one it left behind.
+    rememberCursor()
   }
 
   function moveCursor(dx, dy) {
@@ -125,6 +154,9 @@ Panel {
     cursorActive = true
     focusSection = "configs"
     configIndex = index
+    // Explicit, because hovering the row the cursor already sits on after a
+    // reorder changes no index and so fires no change handler.
+    rememberCursor()
     scrollCursorIntoView()
   }
 
@@ -227,6 +259,15 @@ Panel {
     else if (kind === "text") wireguard.importText(payload, name)
   }
 
+  // Detached on purpose: nothing here waits on wl-copy, and a value the user
+  // clicked is already on screen — a failure to copy it costs nothing that a
+  // second click cannot fix.
+  function copyToClipboard(value) {
+    var text = String(value || "")
+    if (text === "" || text === "--") return
+    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
+  }
+
   function scrollCursorIntoView() {
     if (focusSection !== "configs" || !configRepeater) return
     // itemAt, not configColumn.children[i]: the Repeater itself sits in the
@@ -273,7 +314,10 @@ Panel {
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     }
   }
-  onConfigIndexChanged: scrollCursorIntoView()
+  onConfigIndexChanged: {
+    rememberCursor()
+    scrollCursorIntoView()
+  }
 
   Service {
     id: wireguard
@@ -283,7 +327,7 @@ Panel {
 
   Connections {
     target: wireguard
-    function onProfilesChanged() { root.ensureCursor() }
+    function onProfilesChanged() { root.restoreCursor() }
     // The picker runs whether or not the popup is open (bar right-click,
     // IPC); open the popup so the name prompt has somewhere to appear.
     function onImportReady(kind, payload, suggestedName) {
@@ -321,6 +365,10 @@ Panel {
     function refresh(): string { wireguard.refresh(); return "ok" }
     function down(): string { wireguard.disconnectAll(); return "ok" }
     function status(): string { return wireguard.statusText }
+    // The connection grid without the panel. Rates and ping only move while
+    // something is watching them, so a headless caller sees the totals and
+    // the addresses live, and "--" where a sample would have to be paid for.
+    function details(): string { return wireguard.detailsText() }
     // Headless import — no prompt, the name is derived from the filename.
     // (`import` is a JS keyword, hence the longer name.)
     function importConfig(path: string): string {
@@ -424,7 +472,12 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(340))
+    // Wide enough for the detail grid: two label/value pairs per row, with a
+    // real endpoint ("185.55.56.151:51820", not a short TEST-NET one) and a
+    // /32 tunnel address both reading in full, and the six pixels the grid
+    // gives back to align with the hero switch already deducted. A hostname
+    // endpoint can still outgrow it — that is what the tooltip is for.
+    contentWidth: panel.fittedContentWidth(Style.space(460))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(480))
 
     PanelKeyCatcher {
@@ -508,21 +561,45 @@ Panel {
                 }
               }
 
+              // The switch stays last, hard against the trailing edge — the
+              // detail grid below aligns to its track, and anything parked to
+              // its right would break that.
               trailingControl: Component {
-                ToggleSwitch {
-                  id: powerSwitch
-                  visible: wireguard.profiles.length > 0
-                  checked: wireguard.active
-                  busy: wireguard.busy
-                  hasCursor: header.ringVisible
-                  foreground: hero.foreground
-                  onHovered: function(on) { if (on) header.focusHero() }
-                  onToggled: wireguard.toggle()
+                Row {
+                  spacing: Style.space(4)
 
-                  PanelToolTip {
-                    visible: powerSwitch.containsMouse
-                    text: root.toggleHint
+                  // The QR of the tunnel you are on, without going to its row
+                  // first. Only while something is up: with nothing connected
+                  // it would have no subject.
+                  PanelActionButton {
+                    iconText: "󰐲"
+                    tooltipText: "Show " + wireguard.primaryName + " as a QR code (q)"
+                    visible: wireguard.active
+                    anchors.verticalCenter: parent.verticalCenter
+                    foreground: Qt.darker(hero.foreground, 1.55)
+                    hoverColor: hero.foreground
                     fontFamily: hero.fontFamily
+                    enabled: !wireguard.busy
+                    onHovered: function(on) { if (on) header.focusHero() }
+                    onClicked: wireguard.showQr(wireguard.primaryProfile)
+                  }
+
+                  ToggleSwitch {
+                    id: powerSwitch
+                    visible: wireguard.profiles.length > 0
+                    anchors.verticalCenter: parent.verticalCenter
+                    checked: wireguard.active
+                    busy: wireguard.busy
+                    hasCursor: header.ringVisible
+                    foreground: hero.foreground
+                    onHovered: function(on) { if (on) header.focusHero() }
+                    onToggled: wireguard.toggle()
+
+                    PanelToolTip {
+                      visible: powerSwitch.containsMouse
+                      text: root.toggleHint
+                      fontFamily: hero.fontFamily
+                    }
                   }
                 }
               }
@@ -537,6 +614,106 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
+          }
+
+          // What the tunnel is doing, in the shape the network panel uses for
+          // the same job. Rates and totals come from the interface counters,
+          // the address and endpoint from the profile — nothing here needs a
+          // privilege the widget does not already have. Only the first active
+          // tunnel is described: one endpoint and one ping cannot stand for
+          // two, and the rows below keep their own traffic lines.
+          Column {
+            visible: wireguard.active
+            // Short of the full width by the hero switch's cursor-ring pad:
+            // ToggleSwitch reserves that ring outside its track, so the item
+            // is flush with the edge while the switch you can see is not.
+            // Optical alignment beats geometric here — the numbers and the
+            // track are what the eye lines up.
+            width: parent.width - Style.space(6)
+            spacing: Style.spacing.labelGap
+
+            Text {
+              visible: wireguard.activeNames.length > 1
+              width: parent.width
+              text: "Showing " + wireguard.primaryName
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+              bottomPadding: Style.spacing.labelGap
+            }
+
+            // Two columns of pairs, not four columns of cells: a four-column
+            // grid sizes every column to its own widest value, and one long
+            // endpoint then makes the right half visibly wider than the left.
+            // Each pair takes exactly half instead, whatever is in it.
+            GridLayout {
+              width: parent.width
+              columns: 2
+              columnSpacing: Style.space(14)
+              rowSpacing: Style.spacing.labelGap
+
+              // The whole row goes when the probe is off — a permanent pair of
+              // dashes would suggest a measurement that failed rather than one
+              // nobody asked for. GridLayout skips invisible items, so the
+              // rows below close the gap.
+              DetailPair {
+                visible: wireguard.pingHost !== ""
+                label: "Ping"
+                value: wireguard.fmtPing(wireguard.pingLatency)
+                valueColor: wireguard.pingLoss > 0 ? root.urgent : root.foreground
+              }
+              DetailPair {
+                visible: wireguard.pingHost !== ""
+                label: "Packet Loss"
+                value: wireguard.fmtLoss(wireguard.pingLoss)
+                valueColor: wireguard.pingLoss > 0 ? root.urgent : root.foreground
+              }
+
+              DetailPair {
+                label: "Receiving"
+                value: wireguard.fmtRate(wireguard.trafficOf(wireguard.primaryDevice).rxRate)
+              }
+              DetailPair {
+                label: "Sending"
+                value: wireguard.fmtRate(wireguard.trafficOf(wireguard.primaryDevice).txRate)
+              }
+
+              // Session totals, not lifetime ones: NetworkManager creates the
+              // wg interface at activation, so its counters start at zero.
+              DetailPair {
+                label: "Downloaded"
+                value: wireguard.fmtSize(wireguard.trafficOf(wireguard.primaryDevice).rx)
+              }
+              DetailPair {
+                label: "Uploaded"
+                value: wireguard.fmtSize(wireguard.trafficOf(wireguard.primaryDevice).tx)
+              }
+
+              DetailPair {
+                label: "IP Address"
+                value: root.detailText(wireguard.detail("ip") !== "" ? wireguard.detail("ip") : wireguard.detail("ip6"))
+                tooltipText: "Copy the tunnel address"
+              }
+              DetailPair {
+                label: "Endpoint"
+                value: root.detailText(wireguard.detail("endpoint"))
+                tooltipText: "Copy the endpoint"
+              }
+
+              // Copyable like the two above, and for the same reason: a route
+              // list is exactly what a user pastes into the next config.
+              DetailPair {
+                label: "Allowed IPs"
+                value: root.detailText(wireguard.detail("allowed"))
+                tooltipText: "Copy the routes"
+              }
+              DetailPair {
+                label: "DNS"
+                value: root.detailText(wireguard.detail("dns"))
+                tooltipText: "Copy the DNS servers"
+              }
+            }
           }
 
           PanelSeparator {
@@ -834,6 +1011,81 @@ Panel {
     onCanceled: root.cancelRename()
   }
 
+  // Every cell in the grid holds its place from the moment the tunnel comes
+  // up, so a value that is not in yet reads as "--" rather than collapsing
+  // the row and shoving the list below it around.
+  function detailText(value) {
+    var text = String(value || "")
+    return text === "" ? "--" : text
+  }
+
+  component InfoLabel: Text {
+    color: root.foreground
+    opacity: 0.6
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.bodySmall
+  }
+
+  // Label left, value hard against the right edge of its half. The label
+  // keeps its natural width and the value takes the rest, so a long endpoint
+  // elides inside its own half instead of stealing width from the half next
+  // to it.
+  component DetailPair: Item {
+    id: pair
+
+    property string label: ""
+    property string value: ""
+    property color valueColor: root.foreground
+    // A tooltip is what marks a value as worth copying — the ones that are
+    // are exactly the ones a user retypes elsewhere.
+    property string tooltipText: ""
+    readonly property bool copyable: tooltipText !== "" && value !== "--"
+
+    // Equal preferred widths plus fillWidth is what makes the halves match:
+    // ask for nothing, and the layout hands both cells the same share.
+    Layout.fillWidth: true
+    Layout.preferredWidth: 0
+    implicitHeight: Math.max(pairLabel.implicitHeight, pairValue.implicitHeight)
+
+    InfoLabel {
+      id: pairLabel
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: pair.label
+    }
+
+    Text {
+      id: pairValue
+      anchors.left: pairLabel.right
+      anchors.leftMargin: Style.space(8)
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      text: pair.value
+      color: pair.valueColor
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      horizontalAlignment: Text.AlignRight
+      elide: Text.ElideRight
+
+      MouseArea {
+        id: valueMouse
+        anchors.fill: parent
+        enabled: pair.copyable
+        hoverEnabled: enabled
+        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+        onClicked: root.copyToClipboard(pair.value)
+      }
+
+      // An elided value is unreadable, and these are the ones worth reading —
+      // so the tooltip carries the whole string when the cell could not.
+      PanelToolTip {
+        visible: valueMouse.enabled && valueMouse.containsMouse
+        text: pairValue.truncated ? pair.value + " · " + pair.tooltipText : pair.tooltipText
+        fontFamily: root.fontFamily
+      }
+    }
+  }
+
   component ConfigRow: CursorSurface {
     id: configRow
     // {uuid, name, active} — the row keeps the whole profile so its actions
@@ -888,10 +1140,14 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          // Traffic, not health: rate and session totals say the tunnel is
-          // moving bytes, nothing more — an idle tunnel is not a broken one.
+          // The grid above carries the primary tunnel's numbers in full, so
+          // this row states what it is instead of repeating them. Only a
+          // second active tunnel — which the grid does not describe, and
+          // which nothing in this widget can bring up — keeps a traffic
+          // line of its own.
           text: {
             if (!configRow.connected) return "Click to connect"
+            if (configRow.profile && configRow.profile.uuid === wireguard.primaryUuid) return "Connected — click to disconnect"
             var line = wireguard.trafficLine(configRow.profile ? configRow.profile.ifname : "")
             return line !== "" ? line : "Connected — click to disconnect"
           }

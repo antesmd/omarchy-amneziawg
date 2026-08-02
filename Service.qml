@@ -72,6 +72,79 @@ Item {
     return out
   }
 
+  // The tunnel the detail grid describes — the first active profile in the
+  // sorted list, which is also the one the hero names first. WireGuard can
+  // run several at once; the rest keep their per-row traffic line, because
+  // one endpoint, one address and one ping cannot describe two tunnels.
+  readonly property var primaryProfile: {
+    for (var i = 0; i < profiles.length; i++) {
+      if (profiles[i].active) return profiles[i]
+    }
+    return null
+  }
+  readonly property string primaryUuid: primaryProfile ? primaryProfile.uuid : ""
+  readonly property string primaryName: primaryProfile ? primaryProfile.name : ""
+  readonly property string primaryDevice: primaryProfile ? primaryProfile.ifname : ""
+
+  // Connection facts from `backend.sh details` — ip, ip6, endpoint, allowed,
+  // dns, mtu, peers. Kept with the UUID they describe so a switch shows the
+  // new tunnel's numbers or nothing at all, never the old tunnel's.
+  property var details: ({})
+  property string detailsUuid: ""
+  readonly property bool hasDetails: detailsUuid !== "" && detailsUuid === primaryUuid
+
+  function detail(key) {
+    if (!hasDetails) return ""
+    var value = details[String(key)]
+    return value === undefined ? "" : String(value)
+  }
+
+  // Latency through the tunnel: ICMP bound to the wg device, so a split
+  // tunnel is measured on the path it actually routes. Unprivileged — ping
+  // sockets are open to all users on Omarchy. Set pingHost to "" to switch
+  // the probe off entirely.
+  readonly property string pingHost: String(setting("pingHost", "1.1.1.1")).trim()
+  // Rate, not health, again: a lost packet is a lost packet, not a warning
+  // about the tunnel. Samples are ms, or -1 for a timeout.
+  property var pingSamples: []
+  readonly property bool hasPing: pingSamples.length > 0
+  readonly property real pingLatency: {
+    var total = 0
+    var count = 0
+    for (var i = 0; i < pingSamples.length; i++) {
+      if (pingSamples[i] < 0) continue
+      total += pingSamples[i]
+      count++
+    }
+    return count > 0 ? total / count : -1
+  }
+  readonly property int pingLoss: {
+    if (pingSamples.length === 0) return 0
+    var lost = 0
+    for (var i = 0; i < pingSamples.length; i++) {
+      if (pingSamples[i] < 0) lost++
+    }
+    return Math.round(lost * 100 / pingSamples.length)
+  }
+
+  // The grid's static half — endpoint, address, routes — changes only when
+  // the profile is edited, so it is fetched on a switch and on opening,
+  // never on a timer. Both halves are dropped with the tunnel they describe:
+  // showing the old numbers under a new name would be worse than "--".
+  onPrimaryUuidChanged: {
+    details = ({})
+    detailsUuid = ""
+    pingSamples = []
+    fetchDetails()
+  }
+
+  onTrafficMonitoringChanged: {
+    if (trafficMonitoring) fetchDetails()
+    // A window's worth of stale samples would otherwise be the first thing
+    // the panel shows on reopening.
+    else pingSamples = []
+  }
+
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
     return value === undefined || value === null ? fallback : value
@@ -98,6 +171,45 @@ Item {
     if (trafficProcess.running || activeDevices.length === 0) return
     trafficProcess.command = ["bash", "-c", trafficScript, "wireguard"].concat(activeDevices)
     trafficProcess.running = true
+  }
+
+  function fetchDetails() {
+    if (detailsProcess.running || primaryUuid === "") return
+    _detailsFor = primaryUuid
+    detailsProcess.command = ["bash", backendPath, "details", primaryUuid, primaryDevice]
+    detailsProcess.running = true
+  }
+
+  function applyDetails(raw) {
+    var next = {}
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var pos = lines[i].indexOf("=")
+      if (pos <= 0) continue
+      next[lines[i].slice(0, pos)] = lines[i].slice(pos + 1)
+    }
+    details = next
+    detailsUuid = _detailsFor
+  }
+
+  function samplePing() {
+    if (pingProcess.running || pingHost === "" || primaryDevice === "") return
+    // The tunnel address is the fallback binding for kernels that refuse
+    // SO_BINDTODEVICE to an unprivileged ping; without either, the probe
+    // would measure the physical link and call it the tunnel's latency.
+    pingProcess.command = ["bash", "-c", pingScript, "wireguard",
+      primaryDevice, detail("ip").split("/")[0], pingHost]
+    pingProcess.running = true
+  }
+
+  // -1 is a timeout, which counts as loss; a probe that could not run at all
+  // (no ping binary, a rejected bind) samples nothing rather than reporting
+  // a tunnel-shaped problem that is really a local one.
+  function addPingSample(ms) {
+    var next = pingSamples.slice()
+    next.push(ms)
+    while (next.length > 10) next.shift()
+    pingSamples = next
   }
 
   function applyTraffic(raw) {
@@ -138,6 +250,57 @@ Item {
       if (v < 1024 || i === units.length - 1) break
     }
     return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + units[i]
+  }
+
+  // The detail grid has a column of its own to fill, so it gets the spaced,
+  // two-letter units the rest of the shell uses — fmtBytes stays compact for
+  // the row caption it shares with three buttons.
+  function fmtSize(n) {
+    var v = Number(n)
+    if (!isFinite(v) || v < 0) v = 0
+    if (v < 1024) return Math.round(v) + " B"
+    if (v < 1048576) return (v / 1024).toFixed(1) + " KB"
+    if (v < 1073741824) return (v / 1048576).toFixed(1) + " MB"
+    return (v / 1073741824).toFixed(2) + " GB"
+  }
+
+  function fmtRate(n) {
+    return fmtSize(n) + "/s"
+  }
+
+  function fmtPing(ms) {
+    if (!hasPing) return "--"
+    var v = Number(ms)
+    if (!isFinite(v) || v < 0) return "Timeout"
+    return v.toFixed(v > 0 && v < 10 ? 1 : 0) + " ms"
+  }
+
+  function fmtLoss(percent) {
+    return hasPing ? String(percent) + "%" : "--"
+  }
+
+  // Live counters for one device, or zeros — the grid keeps its rows in
+  // place from the moment a tunnel comes up, so it needs an answer before
+  // the first sample lands.
+  function trafficOf(dev) {
+    var t = traffic[String(dev || "")]
+    return t ? t : { rx: 0, tx: 0, at: 0, rxRate: 0, txRate: 0 }
+  }
+
+  // The panel's grid as one line, for scripts and for anyone who would
+  // rather not open a popup to read six numbers.
+  function detailsText() {
+    if (!active) return "VPN disconnected"
+    var t = trafficOf(primaryDevice)
+    var parts = [primaryName]
+    parts.push("ip=" + (detail("ip") !== "" ? detail("ip") : (detail("ip6") !== "" ? detail("ip6") : "--")))
+    parts.push("endpoint=" + (detail("endpoint") !== "" ? detail("endpoint") : "--"))
+    parts.push("allowed=" + (detail("allowed") !== "" ? detail("allowed") : "--"))
+    parts.push("dns=" + (detail("dns") !== "" ? detail("dns") : "--"))
+    parts.push("rx=" + fmtSize(t.rx) + " (" + fmtRate(t.rxRate) + ")")
+    parts.push("tx=" + fmtSize(t.tx) + " (" + fmtRate(t.txRate) + ")")
+    parts.push("ping=" + fmtPing(pingLatency) + " loss=" + fmtLoss(pingLoss))
+    return parts.join(" · ")
   }
 
   // One caption line: current rate, then session totals.
@@ -240,7 +403,6 @@ Item {
       list.push(entry)
       byUuid[entry.uuid] = entry
     }
-    list.sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0) })
     var firstUp = ""
     for (var j = sep + 1; j < activeEnd; j++) {
       var uuid = lines[j].trim()
@@ -283,6 +445,14 @@ Item {
     for (var d = 0; d < droppedNow.length; d++) _dropQueue.push(droppedNow[d])
     _flushDrops()
     _flushMarkActive()
+    // Sorted after the active flags are in, because the flag is the first
+    // sort key: what is up is what the panel is opened for, and the grid
+    // above describes the profile that lands at the top. Name breaks ties,
+    // so an otherwise unchanged list never reshuffles.
+    list.sort(function(a, b) {
+      if (a.active !== b.active) return a.active ? -1 : 1
+      return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0)
+    })
     profiles = list
     // Track connects made outside the widget too (nmcli, GUI).
     if (firstUp !== "") rememberLast(firstUp)
@@ -608,6 +778,24 @@ Item {
     "  printf '%s %s %s\\n' \"$d\" \"$(cat \"$s/rx_bytes\")\" \"$(cat \"$s/tx_bytes\")\"\n" +
     "done\n"
 
+  // ping bound to the tunnel device, falling back to the tunnel address:
+  // iputils exits 2 for "could not even send" (no such device, a bind the
+  // kernel refused) and 1 for "sent, nothing came back". Only the latter is
+  // a timeout worth charting, so the fallback is tried on 2 alone — a real
+  // timeout must not cost a second probe on every tick. Prints the average
+  // RTT in milliseconds.
+  readonly property string pingScript:
+    "dev=\"$1\"; src=\"$2\"; host=\"$3\"\n" +
+    "command -v ping >/dev/null 2>&1 || exit 2\n" +
+    "rc=0\n" +
+    "out=\"$(ping -n -q -c 1 -W 2 -I \"$dev\" -- \"$host\" 2>/dev/null)\" || rc=$?\n" +
+    "if [ \"$rc\" != 0 ] && [ \"$rc\" != 1 ] && [ -n \"$src\" ]; then\n" +
+    "  rc=0\n" +
+    "  out=\"$(ping -n -q -c 1 -W 2 -I \"$src\" -- \"$host\" 2>/dev/null)\" || rc=$?\n" +
+    "fi\n" +
+    "[ \"$rc\" = 0 ] || exit \"$rc\"\n" +
+    "printf '%s\\n' \"$out\" | awk -F/ '/^rtt|^round-trip/ {print $5; exit}'\n"
+
   readonly property string clipboardScript:
     "command -v wl-paste >/dev/null 2>&1 || exit 2\n" +
     "wl-paste --no-newline --type text/plain 2>/dev/null || wl-paste --no-newline\n"
@@ -622,6 +810,10 @@ Item {
   property bool _pollError: false
   property string _pendingConnect: ""
   property string _exportDest: ""
+  // The UUID the running details query is about — the answer is filed under
+  // it, so a query overtaken by a switch cannot label itself with the new
+  // tunnel's UUID.
+  property string _detailsFor: ""
   // uuid -> name of the profiles active at the previous status poll.
   property var _prevActive: ({})
   property string _notifyDropName: ""
@@ -708,6 +900,18 @@ Item {
     triggeredOnStart: true
     onTriggered: root.sampleTraffic()
   }
+
+  // Slower than the traffic tick on purpose: a probe can sit for its whole
+  // 2s timeout, and a 30s window of ten samples is what makes the loss
+  // figure mean anything.
+  Timer {
+    interval: 3000
+    repeat: true
+    running: root.trafficMonitoring && root.primaryDevice !== "" && root.pingHost !== ""
+    triggeredOnStart: true
+    onTriggered: root.samplePing()
+  }
+
 
   Process {
     id: statusProcess
@@ -942,6 +1146,49 @@ Item {
   }
 
   Process {
+    id: detailsProcess
+    running: false
+    command: []
+    stdout: StdioCollector {
+      id: detailsStdout
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      // A failure says nothing in lastError: this is a decoration on a panel
+      // whose actual job — listing and switching tunnels — is unaffected,
+      // and the grid already reads "--" with no data.
+      // A switch mid-query answered about the tunnel that just left, and the
+      // fetch that switch triggered was refused by the busy guard — so the
+      // stale answer schedules the one the panel is actually waiting for.
+      // Only staleness retries: a query that simply failed is left alone,
+      // because retrying a persistent failure would spin.
+      var stale = root._detailsFor !== root.primaryUuid
+      if (exitCode === 0 && !stale) root.applyDetails(detailsStdout.text)
+      root._detailsFor = ""
+      if (stale && root.primaryUuid !== "") Qt.callLater(root.fetchDetails)
+    }
+  }
+
+  Process {
+    id: pingProcess
+    running: false
+    command: []
+    stdout: StdioCollector {
+      id: pingStdout
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 1) {
+        root.addPingSample(-1)
+        return
+      }
+      if (exitCode !== 0) return
+      var ms = parseFloat(String(pingStdout.text || "").trim())
+      if (isFinite(ms) && ms >= 0) root.addPingSample(ms)
+    }
+  }
+
+  Process {
     id: controlProcess
     running: false
     command: []
@@ -987,6 +1234,10 @@ Item {
       }
       root._pendingConnect = ""
       root.refresh()
+      // An edit can move the address, the endpoint or the routes without
+      // moving the tunnel, so the grid is refetched even when the primary
+      // profile is the one it already describes.
+      if (root.trafficMonitoring) Qt.callLater(root.fetchDetails)
       // A save queued while this operation ran; write it now.
       if (root._pendingSaveUuid !== "") Qt.callLater(root._flushPendingSave)
     }

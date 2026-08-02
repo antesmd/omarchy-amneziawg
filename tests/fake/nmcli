@@ -4,6 +4,7 @@
 #   ifname.<uuid>   configured interface-name
 #   fail-up.<uuid>  if present, `connection up <uuid>` fails
 #   fail-down.<uuid> if present, `connection down <uuid>` fails
+#   props.<uuid>    terse `connection show <uuid>` output (details)
 #   log             every invocation, one line
 set -u
 echo "nmcli $*" >> "$FAKE_DIR/log"
@@ -17,6 +18,13 @@ case "$*" in
     cat "$FAKE_DIR/list" 2>/dev/null
     exit 0 ;;
 esac
+
+# -t connection show <uuid> — the property dump the details command reads.
+if [ "$*" = "-t connection show ${4:-}" ]; then
+  [ -f "$FAKE_DIR/props.$4" ] || { echo "Error: $4 - no such connection profile." >&2; exit 10; }
+  cat "$FAKE_DIR/props.$4"
+  exit 0
+fi
 
 if [ "$1" = "--escape" ]; then # --escape no -g connection.interface-name connection show <uuid>
   u="${7}"

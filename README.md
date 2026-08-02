@@ -1,8 +1,8 @@
 # Omawire — WireGuard tunnels in the Omarchy bar
 
 Connect, switch, import, edit, rename and QR-export WireGuard tunnels from
-the [Omarchy](https://github.com/basecamp/omarchy) bar — with live traffic and a warning when a tunnel drops
-behind your back.
+the [Omarchy](https://github.com/basecamp/omarchy) bar — with live traffic, the
+connection's own numbers, and a warning when a tunnel drops behind your back.
 
 Omawire is an unofficial third-party widget. It is not affiliated with,
 endorsed by, or connected to the WireGuard project.
@@ -79,11 +79,43 @@ The row under the cursor shows three buttons: the pencil asks whether to
 edit the config or the name, the QR square opens the code, the trash can
 deletes. Either answer to the pencil closes the panel — the editor and the
 rename prompt are windows of their own, and the panel would sit in front of
-them. While a tunnel is connected its row shows **traffic** — current
-rate and session totals (`↓ 3.0K/s ↑ 14.8K/s · ↓ 2.6M ↑ 1.1M`), read from
-the interface's `/sys` counters while the panel is open. That line is
+them.
+
+**Connected tunnels sort to the top** of the list, name breaking ties, so
+what is up is the first thing you see and the row the grid describes. The
+cursor follows the profile it was on across that reorder, not the slot it
+held — connecting a row moves it, and an Enter afterwards must not land on
+whatever slid into its place. While a tunnel is up the header carries its
+QR button next to the switch, so sharing the tunnel you are on does not
+mean finding its row first.
+
+**Connection details.** While a tunnel is up the panel shows what it is
+doing, in the same grid the system network widget uses: ping and packet
+loss, current rates, session totals, the tunnel address, the peer endpoint,
+the routes it claims and the DNS it sets. Those last four copy on click, and
+a value too long for its cell shows in full in the tooltip rather than
+staying behind an ellipsis. Everything but the ping is read from
+NetworkManager and `/sys`,
+and the whole block is live only while the panel is open. The numbers are
 activity, not health: WireGuard has no connection state, and an idle tunnel
 is not a broken one.
+
+Nothing in this widget can bring up two tunnels at once — switching is
+exclusive — but `nmcli`, another applet or a profile with autoconnect can.
+Then the grid describes the first and says which one, since one endpoint
+and one ping cannot stand for two; the tunnel it leaves out keeps a compact
+traffic line of its own in the list below
+(`↓ 3.0K/s ↑ 14.8K/s · ↓ 2.6M ↑ 1.1M`). The one in the grid does not — the
+same four numbers twice on one screen is noise.
+
+The **ping** is an ICMP probe bound to the tunnel device, so it measures the
+path the tunnel actually routes rather than your physical link — it is the
+one thing here that leaves your machine. It goes to `1.1.1.1` by default,
+every three seconds while the panel is open, ten samples to a window; set
+`pingHost` to something inside your tunnel, or to an empty string to switch
+the probe off. A split tunnel that does not route the ping host shows `--`
+rather than a scary 100%. Unprivileged: Omarchy leaves ping sockets open to
+all users, so nothing here needs `CAP_NET_RAW`.
 
 **Importing** asks for a name, because the interface is named after it and
 the kernel only accepts up to 15 characters of `[A-Za-z0-9_=+.-]` — provider
@@ -107,7 +139,8 @@ that one obeys kernel rules and belongs to import. The prompt opens in its
 own window, centred on the screen like the QR code, and the panel closes
 behind it; `Esc` or a click outside cancels.
 
-**QR export** (`q`, or the QR button) renders the profile as a QR code in
+**QR export** (`q`, the row's QR button, or the header's while a tunnel is
+up) renders the profile as a QR code in
 its own window, centred on the screen — the panel closes, so nothing sits
 between the code and the phone's camera. `Esc`, `q` or a click outside
 closes it. The PNG lives in `XDG_RUNTIME_DIR` (tmpfs, mode 0600) and is
@@ -147,15 +180,18 @@ they were.
 | Key | Default | Range |
 | --- | --- | --- |
 | `refreshIntervalSec` | `10` | 2–3600 |
+| `pingHost` | `1.1.1.1` | any host, or empty to disable the probe |
 
 ```bash
 omarchy bar plugin set glafeara.wireguard refreshIntervalSec 30
+omarchy bar plugin set glafeara.wireguard pingHost ""     # no latency probe
 ```
 
 ## IPC
 
 ```bash
 omarchy-shell glafeara.wireguard status                  # "VPN: kz" / "VPN disconnected"
+omarchy-shell glafeara.wireguard details                 # the panel's grid on one line
 omarchy-shell glafeara.wireguard toggle                  # connect/disconnect the last used tunnel
 omarchy-shell glafeara.wireguard down                    # disconnect everything
 omarchy-shell glafeara.wireguard refresh
@@ -170,7 +206,9 @@ omarchy-shell glafeara.wireguard qr kz                   # QR window, centred on
 ```
 
 Name-based commands refuse an ambiguous name and list the matching UUIDs
-instead — pass a UUID to disambiguate.
+instead — pass a UUID to disambiguate. `details` answers with the addresses
+and the session totals whether or not the panel is open, and with `--` for
+the rate and ping figures, which are only sampled while it is.
 
 ## What it touches
 
@@ -187,23 +225,29 @@ instead — pass a UUID to disambiguate.
 - `$XDG_RUNTIME_DIR/wg-qr.*.png` — the QR image while its window is open;
   deleted on close.
 - `/sys/class/net/<iface>/statistics/{rx,tx}_bytes` — read-only, for the
-  traffic line.
+  traffic line, plus the interface's address and MTU for the detail grid.
+- **One ICMP echo to `pingHost` every three seconds while the panel is
+  open**, bound to the tunnel device — the only traffic the widget
+  originates, and the only part of it you can switch off in the settings.
 
 Everything runs as your user; authorization is NetworkManager's stock
 polkit policy. Private keys are passed to `nmcli` on stdin, never as
-command-line arguments. No install or uninstall scripts, no services, no
-network calls of its own.
+command-line arguments — and the detail query runs `nmcli` without `-s`, so
+it never reads a secret in the first place. No install or uninstall
+scripts, no services, no telemetry.
 
 ## Tests
 
-`tests/` holds two suites that run the backend against a fake `nmcli` on
+`tests/` holds four suites that run the backend against a fake `nmcli` on
 `PATH` — the only way to exercise the switch rollback paths, since a dead
 endpoint does not make `nmcli connection up` fail — plus a manual
 checklist (`tests/checklist.md`) for what needs real tunnels:
 
 ```bash
+bash tests/test-status.sh
 bash tests/test-connect.sh
 bash tests/test-notify.sh
+bash tests/test-details.sh
 ```
 
 ## Uninstall
