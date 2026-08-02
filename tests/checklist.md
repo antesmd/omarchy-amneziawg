@@ -17,11 +17,55 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
 
 ## Traffic
 
-- [ ] Connected row shows `↓ …/s ↑ …/s · ↓ … ↑ …` within ~4s of opening
-      the panel; totals reset after a reconnect.
+- [ ] The connected row reads "Connected — click to disconnect": its numbers
+      live in the grid above. Bring a second tunnel up with `nmcli` — that
+      row, and only that row, shows `↓ …/s ↑ …/s · ↓ … ↑ …` within ~4s of
+      opening the panel.
+- [ ] Grid totals reset after a reconnect.
+
+## Connection details
+
+- [ ] The grid appears with the tunnel and disappears with it; every cell
+      holds its place from the first frame, reading `--` until its value
+      lands — nothing below it jumps as the numbers arrive.
+- [ ] Address, endpoint, allowed IPs and DNS match the profile; a full
+      tunnel pings in tens of milliseconds, and the figures are the new
+      tunnel's within a second of a switch, never the old one's.
+- [ ] Ping and packet loss stop moving when the panel closes and start
+      from an empty window when it reopens — no stale samples on screen.
+      Close the panel mid-probe (within ~2s of a tick) and reopen: the first
+      frame shows `--`, never a figure from the previous session.
+- [ ] Switch tunnels while a probe is in flight — the old tunnel's latency
+      never appears in the new tunnel's window.
+- [ ] `omarchy-shell glafeara.wireguard details` with the panel closed for
+      more than ten seconds shows `--` for rates, totals and ping, and real
+      values for the addresses. Never `0 B` for a tunnel that has moved
+      megabytes.
+- [ ] A profile with two peers shows `first of 2 peers` under the grid, and
+      `details` says `peers=2 (first shown)`.
+- [ ] A split tunnel that does not route `pingHost` shows `--`, not 100%.
+- [ ] `pingHost` set to `""` drops the Ping and Packet Loss row entirely and
+      spawns no `ping` process while the panel is open.
+- [ ] Clicking the address, endpoint, routes or DNS copies the value
+      (`wl-paste` to check); a hostname endpoint long enough to elide shows
+      in full in the tooltip.
+- [ ] The values' right edge lines up with the hero switch's track, not with
+      the invisible box around it.
+- [ ] With two tunnels up the grid names the one it describes.
+
+## List order
+
+- [ ] Connecting a profile from the middle of the list moves it to the top;
+      the rest stay in name order and nothing else reshuffles on a poll.
+- [ ] With the keyboard cursor on that profile, connecting it keeps the
+      cursor **on it** as it moves up — Enter right after disconnects the
+      same tunnel, not the row that took its old place.
+- [ ] Deleting the profile under the cursor leaves the cursor in range.
 
 ## Export / QR
 
+- [ ] The header's QR button appears only while a tunnel is up, targets the
+      tunnel named in the header, and is gone again after disconnecting.
 - [ ] `q` on a profile (or the QR button) opens the code centred on screen
       and closes the panel; `Esc`, `q` or a click outside closes it and
       deletes `$XDG_RUNTIME_DIR/wg-qr.*.png`. The panel stays closed.

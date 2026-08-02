@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "glafeara.wireguard",
   "name": "Omawire",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "author": "glafeara",
   "license": "MIT",
   "description": "Tunnel status, transactional switching, import, rename, QR export, live traffic and drop notifications in the Omarchy bar. Unofficial third-party widget for WireGuard tunnels; not affiliated with the WireGuard project.",
@@ -18,7 +18,8 @@
     "category": "Network",
     "allowMultiple": false,
     "defaults": {
-      "refreshIntervalSec": 10
+      "refreshIntervalSec": 10,
+      "pingHost": "1.1.1.1"
     },
     "schema": [
       {
@@ -29,6 +30,12 @@
         "max": 3600,
         "step": 1,
         "defaultValue": 10
+      },
+      {
+        "key": "pingHost",
+        "type": "string",
+        "label": "Ping host (empty disables the latency probe)",
+        "defaultValue": "1.1.1.1"
       }
     ]
   }
