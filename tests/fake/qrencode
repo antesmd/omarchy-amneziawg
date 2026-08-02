@@ -1,0 +1,12 @@
+#!/bin/bash
+set -u
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; shift 2; continue; fi
+  shift
+done
+[ -n "$out" ] || exit 2
+[ -n "${FAKE_DIR:-}" ] && [ -e "$FAKE_DIR/fail-qr" ] && exit 4
+[ -n "${FAKE_DIR:-}" ] && [ -e "$FAKE_DIR/slow-qr" ] && sleep 5
+cat >/dev/null
+printf 'PNG' > "$out"

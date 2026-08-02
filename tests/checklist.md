@@ -81,6 +81,13 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
 - [ ] Scanning with the phone's WireGuard app imports a working tunnel.
 - [ ] `omarchy-shell glafeara.wireguard exportConfig <name> <path>` writes a
       0600 file that re-imports losslessly.
+- [ ] Close a QR window, then reload the shell while another QR is visible;
+      the known `$XDG_RUNTIME_DIR/wg-qr.*.png` disappears in both cases. With
+      two monitors, closing or reloading one instance never deletes the
+      other instance's visible QR. Kill the shell while a code is visible,
+      then start it again: the new shell removes the dead shell's QR, while
+      a code owned by a live sibling shell remains. (A reused PID is the
+      residual, extremely narrow limitation.)
 
 ## Notifications
 
@@ -113,3 +120,9 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
       it; `qr` while it is up does the same.
 - [ ] The import prompt (`i` / `v`) still lives inside the panel and gets the
       focus back on cancel.
+- [ ] Start a slow import or switch, then call every IPC action that uses the
+      control worker (`down`, `importConfig`, `rename`, `importPick`,
+      `importPaste`): each replies `error: …`. An editor and an export may
+      start independently during that operation; a second editor or export
+      rejects its already-running worker. While an editor save is queued,
+      another `edit` reports the pending-save error and cannot overwrite it.

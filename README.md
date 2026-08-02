@@ -32,7 +32,8 @@ containing hook directives are rejected with a clear message.
 - **`wireguard-tools`** — only `wg` is used, to validate keys before import.
 - **`zenity`** — optional, for the file picker and the config editor.
   `kdialog` or `yad` also work for the file picker.
-- **`wl-clipboard`** — optional, for importing a config from the clipboard.
+- **`wl-clipboard`** — optional, for importing a config from the clipboard
+  and copying connection details.
 - **`qrencode`** — optional, for showing a profile as a QR code.
 - **`notify-send`** (libnotify) — optional, for the toast when a tunnel is
   deactivated externally.
@@ -43,13 +44,12 @@ No new privileges for any of it: everything still runs as your user.
 
 ```bash
 omarchy plugin add https://github.com/glafeara/omarchy-wireguard.git
-omarchy plugin enable glafeara.wireguard
-omarchy bar plugin add glafeara.wireguard right
+omarchy plugin enable glafeara.wireguard right
 ```
 
-Plugins land disabled so you can read the code before enabling it — this one
-is three QML files and one shell script. Add `--yes` to any of the commands
-to skip the prompts.
+`plugin add` is interactive by default; add `--yes` to that command to skip
+its prompt. The explicit plugin id and `right` placement make `plugin enable`
+non-interactive. The plugin itself is five QML files and one shell script.
 
 ## Using it
 
@@ -139,6 +139,15 @@ itself failed — a plain statement that the state is unknown. A successful
 activation confirms NetworkManager's state, not the peer's reachability:
 WireGuard has no connected/disconnected handshake state to report.
 
+Replacing a profile during import is transactional too. If NetworkManager
+refuses deletion of the old active profile and also refuses its rollback,
+the operation reports that the state is unknown (backend exit `6`) instead
+of implying that only the deletion failed. Both the old and fully built
+replacement profiles are retained for manual recovery; the error names their
+UUIDs rather than discarding the only new configuration. Exit `6` also marks
+a failed cleanup of an incomplete replacement, so editor saves never retry
+automatically on top of a profile that NetworkManager refused to remove.
+
 **Renaming** changes the profile's display name (`connection.id`) only —
 spaces are fine, duplicates are refused. The interface name never changes;
 that one obeys kernel rules and belongs to import. The prompt opens in its
@@ -189,8 +198,8 @@ they were.
 | `pingHost` | `1.1.1.1` | any host, or empty to disable the probe |
 
 ```bash
-omarchy bar plugin set glafeara.wireguard refreshIntervalSec 30
-omarchy bar plugin set glafeara.wireguard pingHost ""     # no latency probe
+omarchy bar set glafeara.wireguard refreshIntervalSec 30
+omarchy bar set glafeara.wireguard pingHost ""     # no latency probe
 ```
 
 ## IPC
@@ -211,7 +220,12 @@ omarchy-shell glafeara.wireguard exportConfig kz ~/kz.conf   # 0600, private key
 omarchy-shell glafeara.wireguard qr kz                   # QR window, centred on screen
 ```
 
-Name-based commands refuse an ambiguous name and list the matching UUIDs
+Commands that start an asynchronous action return `ok` only when it has
+actually been accepted. Control actions reject another running control action;
+picker, clipboard import, QR and export reject only their own already-running
+worker, while an editor may open during a control action and queues its save.
+An editor rejects a second editor or a queued editor save. `rename` to the
+current name is an idempotent `ok`. Name-based commands refuse an ambiguous name and list the matching UUIDs
 instead — pass a UUID to disambiguate. `details` answers with the addresses
 whether or not the panel is open, and with `--` for everything sampled —
 rates, totals and ping — because sampling stops with the panel. A figure
@@ -228,10 +242,16 @@ an old one.
   connected, so the bar's quick toggle reconnects what you actually used.
 - `$XDG_RUNTIME_DIR/omarchy-wireguard.<uid>.{lock,intent,notified}` —
   the cross-instance lock, the short-lived "this deactivation was ours"
-  markers behind the notifications, and the toast cooldown stamp. tmpfs,
-  gone at reboot.
-- `$XDG_RUNTIME_DIR/wg-qr.*.png` — the QR image while its window is open;
-  deleted on close.
+  markers behind the notifications, and the toast cooldown stamp. The
+  backend requires a private, current-user runtime directory (or its safe
+  `/run/user/<uid>` fallback) and refuses to use `/tmp`. These files are
+  private and gone at reboot.
+- `$XDG_RUNTIME_DIR/wg-qr.<shell-pid>.*.png` — the QR image while its window
+  is open; deleted on close. On the next shell startup, images whose owner
+  PID is dead are safely reaped without touching another live monitor's QR.
+- `$XDG_RUNTIME_DIR/wg-edit.<shell-pid>.*` — private editor buffers and
+  result files while zenity is open; deleted on every editor exit and reaped
+  on the next shell startup after a crash.
 - `/sys/class/net/<iface>/statistics/{rx,tx}_bytes` — read-only, for the
   traffic line, plus the interface's address and MTU for the detail grid.
 - **One ICMP echo to `pingHost` every three seconds while the panel is
@@ -246,22 +266,19 @@ scripts, no services, no telemetry.
 
 ## Tests
 
-`tests/` holds four suites that run the backend against a fake `nmcli` on
+`tests/` holds backend suites that run against fake `nmcli`, `wg`, and
+`qrencode` commands on
 `PATH` — the only way to exercise the switch rollback paths, since a dead
 endpoint does not make `nmcli connection up` fail — plus a manual
 checklist (`tests/checklist.md`) for what needs real tunnels:
 
 ```bash
-bash tests/test-status.sh
-bash tests/test-connect.sh
-bash tests/test-notify.sh
-bash tests/test-details.sh
+bash tests/run.sh
 ```
 
 ## Uninstall
 
 ```bash
-omarchy bar plugin remove glafeara.wireguard
 omarchy plugin remove glafeara.wireguard
 ```
 
