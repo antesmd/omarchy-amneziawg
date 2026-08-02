@@ -579,6 +579,10 @@ Panel {
                     foreground: Qt.darker(hero.foreground, 1.55)
                     hoverColor: hero.foreground
                     fontFamily: hero.fontFamily
+                    // A hero action, not a row action: the same size the
+                    // network panel gives the glyph it parks here, rather
+                    // than the row-sized default the CONFIGS buttons use.
+                    fontSize: Style.font.subtitle * 1.5
                     enabled: !wireguard.busy
                     onHovered: function(on) { if (on) header.focusHero() }
                     onClicked: wireguard.showQr(wireguard.primaryProfile)
