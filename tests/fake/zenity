@@ -1,0 +1,8 @@
+#!/bin/bash
+set -u
+for arg in "$@"; do
+  case "$arg" in --filename=*) printf '%s\n' "${arg#--filename=}" > "$FAKE_DIR/edit-buffer-path" ;; esac
+done
+[ -e "$FAKE_DIR/slow-zenity" ] && sleep 5
+# An unchanged, valid config makes backend.sh take its no-change path.
+printf '%s\n' '[Interface]' 'PrivateKey = private'

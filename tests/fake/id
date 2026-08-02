@@ -1,0 +1,5 @@
+#!/bin/bash
+# An unallocated uid keeps the unset-XDG_RUNTIME_DIR regression isolated: the
+# backend must refuse rather than create /tmp state when /run/user/<uid> is
+# unavailable.
+if [ "${1:-}" = "-u" ]; then printf '%s\n' 424242; else /usr/bin/id "$@"; fi

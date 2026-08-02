@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "glafeara.wireguard",
   "name": "Omawire",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "author": "glafeara",
   "license": "MIT",
   "description": "Tunnel status, transactional switching, import, rename, QR export, live traffic and drop notifications in the Omarchy bar. Unofficial third-party widget for WireGuard tunnels; not affiliated with the WireGuard project.",
@@ -17,6 +17,7 @@
     "description": "Toggle, switch and rename NetworkManager WireGuard tunnels, import .conf files, show QR codes, watch traffic, get a toast when a tunnel drops. No sudo required.",
     "category": "Network",
     "allowMultiple": false,
+    "defaultSection": "right",
     "defaults": {
       "refreshIntervalSec": 10,
       "pingHost": "1.1.1.1"

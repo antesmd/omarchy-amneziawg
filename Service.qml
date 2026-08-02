@@ -35,6 +35,10 @@ Item {
   property string lastUuid: ""
   property string actionStatus: ""
   property string lastError: ""
+  // Public action methods return true only after they actually started work.
+  // IPC uses actionRejection to avoid acknowledging a request that a busy
+  // widget would otherwise quietly discard.
+  property string actionRejection: ""
 
   readonly property bool busy: controlProcess.running
   readonly property string statusText: active ? "VPN: " + activeNames.join(" ") : "VPN disconnected"
@@ -166,13 +170,38 @@ Item {
     return n
   }
 
+  function rejectAction(reason) {
+    actionRejection = String(reason)
+    lastError = actionRejection
+    return false
+  }
+
   function refresh() {
-    if (statusProcess.running) return
+    // Timer and manual refreshes coalesce. This is not an operation failure:
+    // recording it in lastError would make the bar urgent forever after a
+    // normal timer overlap, but IPC can still return the rejection reason.
+    if (statusProcess.running) {
+      actionRejection = "a refresh is already running"
+      return false
+    }
+    actionRejection = ""
     // The observation time for mark-active is when this snapshot is
     // *requested* — anything that happens while the poll runs or waits to
     // be parsed is "after the observation" and must keep its marker.
     _statusStartedAt = Math.floor(Date.now() / 1000)
     statusProcess.running = true
+    return true
+  }
+
+  // Control operations need a post-change snapshot, even if an earlier status
+  // poll is in flight. Timers and manual refreshes deliberately do not queue:
+  // otherwise a slow status command could keep polling forever.
+  function refreshAfterChange() {
+    if (statusProcess.running) {
+      _refreshAfterStatus = true
+      return false
+    }
+    return refresh()
   }
 
   function sampleTraffic() {
@@ -517,43 +546,66 @@ Item {
   }
 
   function connectTo(profile) {
-    if (busy || !profile || !profile.uuid) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (!profile || !profile.uuid) return rejectAction("no such profile")
+    actionRejection = ""
     actionStatus = "Connecting " + profile.name + "…"
     _pendingConnect = String(profile.uuid)
     runControl(["connect", profile.uuid])
+    return true
   }
 
   function disconnectOne(profile) {
-    if (busy || !profile || !profile.uuid) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (!profile || !profile.uuid) return rejectAction("no such profile")
+    actionRejection = ""
     actionStatus = "Disconnecting " + profile.name + "…"
     runControl(["down", profile.uuid])
+    return true
   }
 
   function disconnectAll() {
-    if (busy) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    actionRejection = ""
     actionStatus = "Disconnecting…"
     runControl(["down-all"])
+    return true
   }
 
   function deleteConfig(profile) {
-    if (busy || !profile || !profile.uuid) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (!profile || !profile.uuid) return rejectAction("no such profile")
+    actionRejection = ""
     actionStatus = "Deleting " + profile.name + "…"
     runControl(["delete", profile.uuid])
+    return true
   }
 
   // Changes connection.id only — a display label, so spaces and length are
   // fine. The interface name never moves; that is import's job.
   function renameConfig(profile, newName) {
-    if (busy || !profile || !profile.uuid) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (!profile || !profile.uuid) return rejectAction("no such profile")
     var value = String(newName || "").trim()
-    if (value === "" || value === profile.name) return
+    if (value === "") return rejectAction("the new name must not be empty")
+    // Idempotent success: no backend call is needed when it is already named
+    // as requested, but IPC may still honestly answer ok.
+    if (value === profile.name) {
+      actionRejection = ""
+      lastError = ""
+      actionStatus = ""
+      return true
+    }
+    actionRejection = ""
     actionStatus = "Renaming " + profile.name + "…"
     runControl(["rename", profile.uuid, value])
+    return true
   }
 
   function toggle() {
-    if (active) disconnectAll()
-    else if (toggleProfile !== null) connectTo(toggleProfile)
+    if (active) return disconnectAll()
+    if (toggleProfile !== null) return connectTo(toggleProfile)
+    return rejectAction("no WireGuard profile is available")
   }
 
   // Import: a picked file or pasted text becomes an NM connection profile,
@@ -563,17 +615,23 @@ Item {
   signal importReady(string kind, string payload, string suggestedName)
 
   function pickConfigFile() {
-    if (busy || pickerProcess.running) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (pickerProcess.running) return rejectAction("the file picker is already open")
+    actionRejection = ""
     lastError = ""
     actionStatus = "Waiting for the file picker…"
     pickerProcess.running = true
+    return true
   }
 
   function pasteConfig() {
-    if (busy || clipboardProcess.running) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (clipboardProcess.running) return rejectAction("clipboard import is already running")
+    actionRejection = ""
     lastError = ""
     actionStatus = "Reading clipboard…"
     clipboardProcess.running = true
+    return true
   }
 
   // Opens the profile as wg-quick text in zenity's editable view (the
@@ -590,9 +648,17 @@ Item {
   // closed the panel to get out of zenity's way, and lastError has nowhere
   // to be read. A cancelled or unchanged edit is not a failure.
   signal editFailed(string reason)
+  // Terminal editor outcomes that need no panel rescue: cancellation,
+  // unchanged text, and a completed save. Panel uses this only to retire its
+  // handoff marker, so a later headless failure cannot reopen the panel.
+  signal editFinished()
 
   function editConfig(profile, seedText) {
-    if (!profile || !profile.uuid || editProcess.running) return
+    if (!profile || !profile.uuid) return rejectAction("no such profile")
+    if (editProcess.running) return rejectAction("the editor is already open")
+    if (_pendingSaveUuid !== "" || _editRetryUuid !== "")
+      return rejectAction("a previous editor save is still pending")
+    actionRejection = ""
     _editUuid = String(profile.uuid)
     _editName = String(profile.name)
     if (!seedText) lastError = ""
@@ -603,6 +669,7 @@ Item {
     editProcess.stdinEnabled = true
     editProcess.command = ["bash", backendPath, "edit", _editUuid, _editName]
     editProcess.running = true
+    return true
   }
 
   // Export hands the config — private key included — out of NetworkManager's
@@ -620,14 +687,17 @@ Item {
   readonly property bool qrVisible: qrLoading || qrPath !== "" || qrError !== ""
 
   function exportToPath(profile, path) {
-    if (!profile || !profile.uuid || exportProcess.running) return
+    if (!profile || !profile.uuid) return rejectAction("no such profile")
+    if (exportProcess.running) return rejectAction("an export is already running")
     var dest = String(path || "")
-    if (dest === "") return
+    if (dest === "") return rejectAction("no destination path")
+    actionRejection = ""
     lastError = ""
     _exportDest = dest
     actionStatus = "Exporting " + profile.name + "…"
     exportProcess.command = ["bash", backendPath, "export-file", profile.uuid, dest]
     exportProcess.running = true
+    return true
   }
 
   // Returns "" when a code is on its way, or why nothing will appear.
@@ -662,15 +732,30 @@ Item {
     // The process itself is left to finish: killing qrencode mid-write would
     // strand the file mktemp already created.
     _qrWanted = false
-    if (qrPath !== "") {
-      qrCleanupProcess.command = ["rm", "-f", "--", qrPath]
-      qrCleanupProcess.running = true
-    }
+    removeQrFile(qrPath)
     qrPath = ""
     qrName = ""
     qrLoading = false
     qrError = ""
   }
+
+  // Each path gets its own detached remover. A shared Process can have its
+  // command overwritten by a second close or an unwanted render result,
+  // leaving private-key PNGs behind; detached children also outlive Service
+  // destruction long enough to perform this tiny, path-specific cleanup.
+  function removeQrFile(path) {
+    var knownPath = String(path || "")
+    if (knownPath !== "") Quickshell.execDetached(["rm", "-f", "--", knownPath])
+  }
+
+  // A shell reload destroys this Service without a window-close signal.  The
+  // current PNG is known to this instance, so remove only that path; do not
+  // sweep wg-qr.* broadly because another monitor can legitimately own one.
+  Component.onDestruction: closeQr()
+  // SIGKILL and a hard shell crash cannot run the destruction handler. The
+  // backend identifies PNGs by this shell's parent PID, so startup safely
+  // reaps files from a dead previous shell without touching a live monitor.
+  Component.onCompleted: Quickshell.execDetached(["bash", backendPath, "cleanup-runtime"])
 
   function _flushDrops() {
     if (notifyProcess.running || _dropQueue.length === 0) return
@@ -704,14 +789,16 @@ Item {
   // profile the user never pointed at. The panel blocks this earlier with a
   // clearer message; this is the backstop for the headless entry points.
   function importFile(path, name) {
-    if (busy || !path || !name) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (!path || !name) return rejectAction("a config path and name are required")
     if (countByIfname(name) > 1) {
-      lastError = "Several profiles use the interface " + name + " — not replacing an ambiguous match"
-      return
+      return rejectAction("several profiles use the interface " + name + " — not replacing an ambiguous match")
     }
+    actionRejection = ""
     var existing = findByIfname(name)
     actionStatus = "Importing " + name + "…"
     runControl(["import", String(name), existing ? existing.uuid : "", String(path)])
+    return true
   }
 
   // Writes a queued editor save once controlProcess is free. Bypasses
@@ -736,14 +823,16 @@ Item {
   }
 
   function importText(text, name) {
-    if (busy || !text || !name) return
+    if (busy) return rejectAction("another WireGuard operation is already running")
+    if (!text || !name) return rejectAction("config text and a name are required")
     if (countByIfname(name) > 1) {
-      lastError = "Several profiles use the interface " + name + " — not replacing an ambiguous match"
-      return
+      return rejectAction("several profiles use the interface " + name + " — not replacing an ambiguous match")
     }
+    actionRejection = ""
     var existing = findByIfname(name)
     actionStatus = "Importing " + name + "…"
     runControl(["import", String(name), existing ? existing.uuid : ""], String(text))
+    return true
   }
 
   // The connection (and interface) is named after the file, and the kernel
@@ -849,6 +938,9 @@ Item {
   // True while lastError describes a failed status poll, so a successful
   // poll knows it may clear it.
   property bool _pollError: false
+  // One coalesced poll requested while statusProcess was running. This keeps
+  // post-control state fresh even if the normal interval is as high as 3600s.
+  property bool _refreshAfterStatus: false
   property string _pendingConnect: ""
   property string _exportDest: ""
   // The UUID the running details query is about — the answer is filed under
@@ -976,6 +1068,10 @@ Item {
         root.lastError = root.elide(statusStderr.text || "Failed to read WireGuard status")
         root._pollError = true
       }
+      if (root._refreshAfterStatus) {
+        root._refreshAfterStatus = false
+        Qt.callLater(root.refreshAfterChange)
+      }
     }
   }
 
@@ -1028,11 +1124,13 @@ Item {
         return
       }
       // 3 = Cancel, 4 = nothing changed; neither is worth a message.
+      if (exitCode === 3 || exitCode === 4) {
+        root.editFinished()
+        return
+      }
       if (exitCode !== 0) {
-        if (exitCode !== 3 && exitCode !== 4) {
-          root.lastError = "Could not open " + name
-          root.editFailed(root.lastError)
-        }
+        root.lastError = "Could not open " + name
+        root.editFailed(root.lastError)
         return
       }
       var text = String(editStdout.text || "")
@@ -1120,10 +1218,7 @@ Item {
       // The window closed while we rendered: nobody is waiting for this, and
       // a successful result is key material — delete it and say nothing.
       if (!root._qrWanted) {
-        if (path !== "") {
-          qrCleanupProcess.command = ["rm", "-f", "--", path]
-          qrCleanupProcess.running = true
-        }
+        root.removeQrFile(path)
         return
       }
       if (exitCode === 0 && path !== "") {
@@ -1133,12 +1228,6 @@ Item {
         root.qrError = root.elide(qrStderr.text || "Could not render the QR code")
       }
     }
-  }
-
-  Process {
-    id: qrCleanupProcess
-    running: false
-    command: []
   }
 
   Process {
@@ -1259,6 +1348,11 @@ Item {
       // editor would target the already-deleted old profile — so the retry
       // state is cleared and only the reason is shown.
       var savedNotUp = op === "import" && exitCode === 5
+      var completedEditorSave = op === "import" && root._editRetryName !== ""
+      // 6 means import needs manual recovery: rollback or incomplete-profile
+      // cleanup kept one or more replacements. Never reopen an editor
+      // automatically: another save could hide that recovery state.
+      var importStateUnknown = op === "import" && exitCode === 6
       if (exitCode === 0 || savedNotUp) {
         if (root._pendingConnect !== "") root.rememberLast(root._pendingConnect)
         root.lastError = savedNotUp
@@ -1268,19 +1362,27 @@ Item {
         root._editRetryUuid = ""
         root._editRetryName = ""
         root._editRetryText = ""
+        if (completedEditorSave) root.editFinished()
       } else {
         root.actionStatus = ""
         // 20/21 (connect only): the switch failed; the backend's stderr says
         // whether the previous tunnels were restored (20) or the rollback
         // itself failed (21). Either way the poll below shows what is up.
         var reason = root.elide(root._controlError || "NetworkManager operation failed")
+        if (importStateUnknown) {
+          root.lastError = reason
+          root.editFailed(reason)
+          root._editRetryUuid = ""
+          root._editRetryName = ""
+          root._editRetryText = ""
         // A write refused by wg_check must not cost the edit that produced
         // it; hand the text back to the editor with the reason attached.
-        if (op === "import" && root._editRetryName !== "") root.retryEdit(root._editRetryUuid, root._editRetryName, root._editRetryText, reason)
-        else root.lastError = reason
+        } else if (op === "import" && root._editRetryName !== "") {
+          root.retryEdit(root._editRetryUuid, root._editRetryName, root._editRetryText, reason)
+        } else root.lastError = reason
       }
       root._pendingConnect = ""
-      root.refresh()
+      root.refreshAfterChange()
       // An edit can move the address, the endpoint or the routes without
       // moving the tunnel, so the grid is refetched even when the primary
       // profile is the one it already describes.

@@ -38,13 +38,17 @@
 #                               text (stdin, or [file]); replaces [old-uuid],
 #                               keeping its connection.id and interface-name,
 #                               and reconnects if it was active. Exit 5 means
-#                               the profile was saved but reconnecting failed.
+#                               the profile was saved but reconnecting failed;
+#                               exit 6 means manual recovery is required
+#                               (rollback or incomplete-profile cleanup left
+#                               one or both profiles in an unknown state).
 #   export <uuid>               print the profile as wg-quick config text
 #   export-file <uuid> <path>   write the config to a file, mode 0600
 #   qr-png <uuid>               render the config as a QR PNG in
 #                               XDG_RUNTIME_DIR, print its path (exit 2 =
 #                               qrencode missing; the caller deletes the
 #                               file when done)
+#   cleanup-runtime             remove QR/editor files owned by a dead shell
 #   edit <uuid> <name>          zenity editor round-trip (seed text on stdin)
 #   notify-drop <uuid> <name>   decide whether an observed deactivation was
 #                               external; exit 0 = external (toast sent,
@@ -58,6 +62,7 @@ set -o pipefail
 # value like "Address = *" must stay a literal asterisk, not a file list.
 set -f
 export LC_ALL=C
+umask 077
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -66,10 +71,35 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed"; }
 # One writer at a time, across every widget instance (one per monitor).
 # The fd stays open for the life of the process — including through the
 # `exec nmcli` tail calls — so the lock covers the whole operation.
+RUNTIME_DIR=""
+
+# State files coordinate separate bar instances and can suppress desktop
+# notifications, so they must never fall back to a predictable path in /tmp.
+# XDG_RUNTIME_DIR is normally a mode-0700, per-user tmpfs.  A non-desktop
+# invocation may not inherit it; /run/user/<uid> is the same safe location
+# when it exists.  Refuse anything else rather than following a symlink or
+# truncating an attacker-controlled file.
+ensure_runtime_dir() {
+  [ -n "$RUNTIME_DIR" ] && return 0
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" mode
+  [ -n "$dir" ] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ] ||
+    die "A private XDG_RUNTIME_DIR is required for WireGuard state"
+  mode="$(stat -Lc '%a' -- "$dir" 2>/dev/null)" ||
+    die "Cannot inspect XDG_RUNTIME_DIR"
+  case "$mode" in
+    ''|*[!0-7]*) die "XDG_RUNTIME_DIR has unsafe permissions" ;;
+  esac
+  # The XDG runtime directory is private (0700): even state names and marker
+  # timing should not be exposed to another local account.
+  [ $((8#$mode & 0077)) -eq 0 ] ||
+    die "XDG_RUNTIME_DIR has unsafe permissions"
+  RUNTIME_DIR="$dir"
+}
+
 lock() {
   need flock
-  local dir="${XDG_RUNTIME_DIR:-/tmp}"
-  exec 9>>"$dir/omarchy-wireguard.$(id -u).lock" || die "Cannot open the lock file"
+  ensure_runtime_dir
+  exec 9>>"$RUNTIME_DIR/omarchy-wireguard.$(id -u).lock" || die "Cannot open the lock file"
   flock -w 30 9 || die "Another WireGuard operation is already running"
 }
 
@@ -88,7 +118,10 @@ lock() {
 
 INTENT_TTL=7200
 
-runtime_state() { printf '%s/omarchy-wireguard.%s.%s' "${XDG_RUNTIME_DIR:-/tmp}" "$(id -u)" "$1"; }
+runtime_state() {
+  ensure_runtime_dir
+  printf '%s/omarchy-wireguard.%s.%s' "$RUNTIME_DIR" "$(id -u)" "$1"
+}
 
 # Marker-file helpers. Failures are swallowed: a missed marker costs one
 # spurious notification, not a broken operation. Both rewrites drop expired
@@ -392,7 +425,10 @@ cmd_rename() {
   # The QML refuses duplicates too, but each widget instance judges by its
   # own possibly-stale snapshot — this check under the flock is the
   # authoritative one. NetworkManager itself would happily take the dup.
-  nmcli --escape no -t -f NAME connection show | grep -qxF "$new_id" &&
+  local names
+  names="$(nmcli --escape no -t -f NAME connection show)" ||
+    die "Could not list existing profile names"
+  printf '%s\n' "$names" | grep -qxF "$new_id" &&
     die "A profile named $new_id already exists"
   exec nmcli connection modify "$uuid" connection.id "$new_id"
 }
@@ -519,7 +555,7 @@ parse_config() {
 }
 
 cmd_import() {
-  local name="$1" old_uuid="${2:-}" src="${3:-}"
+  local name="$1" old_uuid="${2:-}" src="${3:-}" uuid="" import_committed=0 old_was_active=0
   need wg
   need nmcli
   # Replacing keeps the old profile's identity. connection.id is a free-form
@@ -544,8 +580,70 @@ cmd_import() {
   fi
   parse_config
 
+  # Allocate the UUID ourselves.  nmcli's success message is human-readable
+  # output and not an API; parsing it could leave an orphan if its wording
+  # changes.  Linux supplies a dependency-free, cryptographically random UUID.
+  uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)" ||
+    die "Could not allocate a UUID for the imported profile"
+  [[ "$uuid" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] ||
+    die "Could not allocate a UUID for the imported profile"
+  cleanup_import() {
+    [ "$import_committed" = 1 ] && return 0
+    remove_incomplete_replacement() {
+      if ! nmcli connection delete "$uuid" >/dev/null 2>&1; then
+        printf '%s\n' "Could not remove incomplete replacement $uuid; state is unknown — check connections manually" >&2
+        # Keeping the replacement is safer than retrying an editor save on
+        # top of it. Disarm the EXIT trap before terminal recovery exit 6.
+        import_committed=1
+        trap - EXIT HUP INT TERM
+        exit 6
+      fi
+    }
+    # A signal can be delivered while nmcli is finishing old-profile delete.
+    # Inspect the resulting state before deleting the replacement: if old is
+    # gone, preserving new is the only outcome that cannot leave zero usable
+    # profiles. If old remains and was active, restore it *before* deleting
+    # new; a failed restoration keeps both profiles and says the state is
+    # unknown. A query failure likewise preserves new rather than destroying
+    # the only profile that may remain.
+    if [ -n "$old_uuid" ]; then
+      if nmcli --escape no -g connection.id connection show "$old_uuid" >/dev/null 2>&1; then
+        if [ "$old_was_active" = 1 ]; then
+          if nmcli connection up "$old_uuid" >/dev/null 2>&1; then
+            clear_intent "$old_uuid"
+            remove_incomplete_replacement
+          else
+            import_committed=1
+            printf '%s\n' "Interrupted replacement left tunnel state unknown. Kept replacement $uuid and old profile $old_uuid — check your connections manually" >&2
+            trap - EXIT HUP INT TERM
+            exit 6
+          fi
+        else
+          remove_incomplete_replacement
+        fi
+      else
+        import_committed=1
+        printf '%s\n' "Could not determine whether old profile $old_uuid remains. Kept replacement $uuid; state is unknown — check your connections manually" >&2
+        trap - EXIT HUP INT TERM
+        exit 6
+      fi
+    else
+      remove_incomplete_replacement
+    fi
+  }
+  # Once connection add is attempted, every error and signal removes the
+  # temporary profile until the replacement transaction commits.
+  trap 'cleanup_import' EXIT
+  trap 'if [ "$import_committed" = 1 ]; then trap - EXIT HUP INT TERM; printf "%s\n" "Saved, but reconnecting was interrupted" >&2; exit 5; else exit 1; fi' HUP INT TERM
+  commit_import() {
+    import_committed=1
+    # Keep the signal handler: it maps a later interruption to saved-but-not-
+    # reconnected exit 5. Only the destructive EXIT cleanup is disarmed.
+    trap - EXIT
+  }
+
   local -a args=(connection add type wireguard
-    con-name ".$ifname.import.$$" ifname "$ifname" autoconnect no)
+    con-name ".$ifname.import.$$" connection.uuid "$uuid" ifname "$ifname" autoconnect no)
   if [ -n "$ADDR4" ]; then args+=(ipv4.method manual ipv4.addresses "$ADDR4")
   else args+=(ipv4.method disabled); fi
   if [ -n "$ADDR6" ]; then args+=(ipv6.method manual ipv6.addresses "$ADDR6")
@@ -569,16 +667,10 @@ cmd_import() {
       args+=(ipv4.route-table "$TABLE" ipv6.route-table "$TABLE") ;;
   esac
 
-  local out uuid
+  local out
   out="$(nmcli "${args[@]}" 2>&1)" || die "$out"
-  uuid="$(printf '%s\n' "$out" | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}' | head -1)"
-  [ -n "$uuid" ] || die "Could not determine the new profile's UUID"
-
-  # From here on a failure must not leave the half-built profile behind.
-  fail() {
-    nmcli connection delete "$uuid" >/dev/null 2>&1
-    die "$1"
-  }
+  # From here on a failure is covered by cleanup_import's EXIT trap.
+  fail() { die "$1"; }
 
   # Secrets go in over the interactive editor's stdin, not argv.
   local feed peer
@@ -616,11 +708,14 @@ cmd_import() {
   # tunnels while the editor sat open.
   out="$(nmcli connection modify "$uuid" connection.id "$con_id" 2>&1)" ||
     fail "Could not rename the imported profile: $out"
+  # A fresh profile is persistent and complete at this point.  There is no
+  # old profile to protect, so later signals must keep the usable new one.
+  [ -z "$old_uuid" ] && commit_import
   if [ -n "$old_uuid" ]; then
-    local was_active=0 active
+    local active
     active="$(active_wg_uuids)" || fail "Could not list active connections"
-    printf '%s\n' "$active" | grep -qxF "$old_uuid" && was_active=1
-    if [ "$was_active" = 1 ]; then
+    printf '%s\n' "$active" | grep -qxF "$old_uuid" && old_was_active=1
+    if [ "$old_was_active" = 1 ]; then
       mark_down "$old_uuid"
       out="$(nmcli connection down "$old_uuid" 2>&1)" || {
         clear_intent "$old_uuid"
@@ -630,11 +725,27 @@ cmd_import() {
     out="$(nmcli connection delete "$old_uuid" 2>&1)" || {
       # Roll back: the tunnel was only taken down for the swap, so a failed
       # swap must not leave the VPN silently off.
-      [ "$was_active" = 1 ] && nmcli connection up "$old_uuid" >/dev/null 2>&1 &&
-        clear_intent "$old_uuid"
+      if [ "$old_was_active" = 1 ]; then
+        if nmcli connection up "$old_uuid" >/dev/null 2>&1; then
+          clear_intent "$old_uuid"
+        else
+          # Both profiles still exist, but neither activation outcome is
+          # trustworthy. Keep the fully built replacement as well as old;
+          # deleting it here would throw away the only new configuration.
+          commit_import
+          trap - HUP INT TERM
+          printf '%s\n' "Could not delete the old profile: $out" >&2
+          printf '%s\n' "Rollback failed; tunnel state is unknown. Kept replacement $uuid and old profile $old_uuid — check your connections manually" >&2
+          exit 6
+        fi
+      fi
       fail "Could not delete the old profile: $out"
     }
-    if [ "$was_active" = 1 ]; then
+    # The old profile is gone.  From this exact boundary the replacement is
+    # committed even if activation is interrupted or fails (exit 5): deleting
+    # it in an EXIT trap here would leave the user with neither profile.
+    commit_import
+    if [ "$old_was_active" = 1 ]; then
       # The replacement is complete; a failed activation must not delete it,
       # and must not read as a failed save either — the UI would reopen the
       # editor against the already-deleted old profile. Exit 5 says "saved,
@@ -646,6 +757,8 @@ cmd_import() {
       clear_intent "$uuid"
     fi
   fi
+  [ "$import_committed" = 1 ] || commit_import
+  trap - HUP INT TERM
 }
 
 # ---------------------------------------------------------------------------
@@ -658,6 +771,9 @@ cmd_export() {
   local pk="" port="" mtu="" fwmark="" peer_routes="" rtable=""
   local addr4="" addr6="" dns4="" dns6="" dnssearch="" peers=""
   local line key value
+  local raw
+  raw="$(nmcli -s -t connection show "$uuid")" ||
+    die "Could not read the profile from NetworkManager"
   while IFS= read -r line; do
     key="${line%%:*}"
     value="$(unescape "${line#*:}")"
@@ -675,7 +791,7 @@ cmd_export() {
       ipv6.dns) dns6="$value" ;;
       ipv4.dns-search) dnssearch="$value" ;;
     esac
-  done < <(nmcli -s -t connection show "$uuid")
+  done <<< "$raw"
   [ -n "$pk" ] || die "Could not read the private key from NetworkManager"
 
   local joined
@@ -725,8 +841,9 @@ cmd_export() {
 # with mode 0600 no matter what existed at the destination: written as a
 # 0600 temp in the destination directory, then renamed over the target —
 # plain `umask 077` + `>` would keep a pre-existing file's 0644. The QR PNG
-# lives only in XDG_RUNTIME_DIR (tmpfs on Omarchy, mode 0700, gone by
-# reboot).
+# lives only in XDG_RUNTIME_DIR (tmpfs on Omarchy, mode 0700). Explicit close
+# and Service destruction remove it; a hard crash is reaped on the next
+# Service startup by cleanup-runtime.
 # ---------------------------------------------------------------------------
 
 cmd_export_file() {
@@ -740,7 +857,8 @@ cmd_export_file() {
   [ -d "$dir" ] || die "No such directory: $dir"
   umask 077
   tmp="$(mktemp -- "$dir/.wg-export.XXXXXX")" || die "Cannot create a file in $dir"
-  trap 'rm -f "$tmp"' EXIT HUP INT TERM
+  trap 'rm -f "$tmp"; exit 1' HUP INT TERM
+  trap 'rm -f "$tmp"' EXIT
   cmd_export "$uuid" > "$tmp" || die "Could not export the profile"
   # -T: dest is the file itself, never a directory to move into.
   mv -fT -- "$tmp" "$dest" || die "Could not write $dest"
@@ -749,21 +867,55 @@ cmd_export_file() {
 
 # Renders the PNG and prints its path — the panel displays it inline and
 # deletes it when the QR dialog closes, so the file's lifetime belongs to
-# the caller, not to a trap here. XDG_RUNTIME_DIR is tmpfs with mode 0700:
-# nothing lands on disk, and a crashed caller leaks the file only until
-# reboot.
+# the caller, not to a trap here. XDG_RUNTIME_DIR is tmpfs with mode 0700;
+# a crashed caller's owned file is safely reaped on the next Service start.
 cmd_qr_png() {
   local uuid="$1" dir png
   command -v qrencode >/dev/null 2>&1 ||
     { echo "qrencode is not installed — sudo pacman -S qrencode" >&2; exit 2; }
-  dir="${XDG_RUNTIME_DIR:-}"
-  [ -n "$dir" ] && [ -d "$dir" ] ||
-    die "XDG_RUNTIME_DIR is not available — refusing to write key material anywhere less private"
-  umask 077
-  png="$(mktemp -- "$dir/wg-qr.XXXXXX.png")" || die "Cannot create a file in $dir"
+  ensure_runtime_dir
+  dir="$RUNTIME_DIR"
+  # The parent is Quickshell's Process child. All monitors in one shell share
+  # that PID, so cleanup-runtime can distinguish a crashed old shell from a live
+  # sibling monitor without sweeping another visible QR.
+  png="$(mktemp -- "$dir/wg-qr.$PPID.XXXXXX.png")" || die "Cannot create a file in $dir"
+  # A trapped signal is otherwise handled after the foreground encoder exits
+  # and bash would continue to print a now-deleted path as a false success.
+  trap 'rm -f -- "$png"; exit 1' HUP INT TERM
+  trap 'rm -f -- "$png"' EXIT
   cmd_export "$uuid" | qrencode -t PNG -s 6 -m 2 -o "$png" ||
-    { rm -f "$png"; die "Could not encode the config as a QR code"; }
+    die "Could not encode the config as a QR code"
+  trap - EXIT HUP INT TERM
   printf '%s\n' "$png"
+}
+
+# Remove only known-safe stale secret-bearing runtime files. New-format names
+# carry their shell owner PID; a live owner may still have a window open on
+# another monitor. Legacy QR names predate ownership and are retained for a
+# day so an in-place plugin update cannot erase a displayed old-format QR.
+cmd_cleanup_runtime() {
+  local dir png base owner now mtime
+  ensure_runtime_dir
+  dir="$RUNTIME_DIR"
+  now="$(date +%s)"
+  # Globbing is disabled globally while parsing config values, so enumerate
+  # through find rather than temporarily re-enabling it around key material.
+  while IFS= read -r -d '' png; do
+    [ -f "$png" ] && [ ! -L "$png" ] || continue
+    base="${png##*/}"
+    if [[ "$base" =~ ^wg-qr\.([0-9]+)\.[A-Za-z0-9]{6}\.png$ || "$base" =~ ^wg-edit\.([0-9]+)\.[A-Za-z0-9]{6}$ ]]; then
+      owner="${BASH_REMATCH[1]}"
+      kill -0 "$owner" 2>/dev/null && continue
+      rm -f -- "$png"
+      continue
+    fi
+    # Legacy wg-qr.XXXXXX.png: no owner to inspect, so only reap a clearly
+    # stale regular file. PID reuse remains a theoretical limitation of the
+    # ownership format and is documented in the manual checklist.
+    mtime="$(stat -Lc '%Y' -- "$png" 2>/dev/null)" || continue
+    case "$mtime" in ''|*[!0-9]*) continue ;; esac
+    [ $((now - mtime)) -gt 86400 ] && rm -f -- "$png"
+  done < <(find "$dir" -maxdepth 1 -type f \( -name 'wg-qr.*.png' -o -name 'wg-edit.*' \) -print0)
 }
 
 # ---------------------------------------------------------------------------
@@ -773,13 +925,20 @@ cmd_qr_png() {
 # ---------------------------------------------------------------------------
 
 cmd_edit() {
-  local uuid="$1" name="$2" seed src tmp buf
+  local uuid="$1" name="$2" seed src dir tmp buf
   seed="$(cat)"
   command -v zenity >/dev/null 2>&1 || exit 2
   src="$(cmd_export "$uuid")" || exit 1
-  umask 077
-  tmp="$(mktemp)" && buf="$(mktemp)" || exit 1
-  trap 'rm -f "$tmp" "$buf"' EXIT
+  ensure_runtime_dir
+  dir="$RUNTIME_DIR"
+  # Both files contain a complete WireGuard config. Keep them in the private
+  # runtime directory, never /tmp, and tag them for safe crash cleanup.
+  tmp="$(mktemp -- "$dir/wg-edit.$PPID.XXXXXX")" || exit 1
+  # Install cleanup before attempting the second allocation: it can fail
+  # after tmp already holds private config output.
+  trap 'rm -f -- "$tmp" "${buf:-}"; exit 1' HUP INT TERM
+  trap 'rm -f -- "$tmp" "${buf:-}"' EXIT
+  buf="$(mktemp -- "$dir/wg-edit.$PPID.XXXXXX")" || exit 1
   if [ -n "$seed" ]; then printf '%s\n' "$seed" > "$buf"
   else printf '%s\n' "$src" > "$buf"; fi
   zenity --text-info --editable --filename="$buf" \
@@ -809,6 +968,7 @@ case "${1:-}" in
   export) cmd_export "$2" ;;
   export-file) cmd_export_file "$2" "$3" ;;
   qr-png) cmd_qr_png "$2" ;;
+  cleanup-runtime|cleanup-qr) cmd_cleanup_runtime ;;
   edit) cmd_edit "$2" "$3" ;;
-  *) die "Usage: backend.sh status|details|connect|down|down-all|delete|rename|import|export|export-file|qr-png|edit ..." ;;
+  *) die "Usage: backend.sh status|details|connect|down|down-all|delete|rename|import|export|export-file|qr-png|cleanup-runtime|edit ..." ;;
 esac

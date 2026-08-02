@@ -214,14 +214,15 @@ Panel {
     if (kind === "name") {
       if (!requestRename(profile)) return
     } else {
-      handOffToEditor(profile)
+      if (!handOffToEditor(profile)) return
     }
     close()
   }
 
   function handOffToEditor(profile) {
+    if (!wireguard.editConfig(profile, "")) return false
     editHandedOff = true
-    wireguard.editConfig(profile, "")
+    return true
   }
 
   // Returns whether the prompt opened, so callers know whether the panel has
@@ -351,6 +352,10 @@ Panel {
       root.editHandedOff = false
       if (!root.opened) root.open()
     }
+    // Cancel, no-change and completed saves are terminal but not failures.
+    // Retire the UI-only marker so a later headless editor failure cannot
+    // mistake this panel for the caller that needs reopening.
+    function onEditFinished() { root.editHandedOff = false }
   }
 
   IpcHandler {
@@ -361,9 +366,15 @@ Panel {
     function hide(): void { root.close() }
     // VPN toggle, not panel visibility — open/close/show/hide already cover
     // the popup, and the bar's left click promises the same thing.
-    function toggle(): void { wireguard.toggle() }
-    function refresh(): string { wireguard.refresh(); return "ok" }
-    function down(): string { wireguard.disconnectAll(); return "ok" }
+    function toggle(): string {
+      return wireguard.toggle() ? "ok" : "error: " + wireguard.actionRejection
+    }
+    function refresh(): string {
+      return wireguard.refresh() ? "ok" : "error: " + wireguard.actionRejection
+    }
+    function down(): string {
+      return wireguard.disconnectAll() ? "ok" : "error: " + wireguard.actionRejection
+    }
     function status(): string { return wireguard.statusText }
     // The connection grid without the panel. Rates and ping only move while
     // something is watching them, so a headless caller sees the totals and
@@ -375,8 +386,7 @@ Panel {
       var name = wireguard.sanitizeName(path)
       if (!wireguard.isValidName(name)) return "error: cannot derive an interface name from " + path
       if (wireguard.countByIfname(name) > 1) return "error: ambiguous: several profiles use the interface " + name
-      wireguard.importFile(path, name)
-      return name
+      return wireguard.importFile(path, name) ? name : "error: " + wireguard.actionRejection
     }
     // Takes a connection name or a profile UUID; a name shared by several
     // profiles is refused rather than resolved to an arbitrary one.
@@ -388,8 +398,7 @@ Panel {
         if (n > 1) return "error: ambiguous name: " + target + " — use a UUID: " + wireguard.uuidsForName(target).join(" ")
         profile = wireguard.findByName(target)
       }
-      wireguard.editConfig(profile, "")
-      return "ok"
+      return wireguard.editConfig(profile, "") ? "ok" : "error: " + wireguard.actionRejection
     }
     // Same target resolution as edit; the new name is a display label, so
     // anything single-line goes — except a name another profile already
@@ -405,11 +414,14 @@ Panel {
       var value = String(newName || "").trim()
       if (value === "") return "error: the new name must not be empty"
       if (value !== profile.name && wireguard.countByName(value) > 0) return "error: a profile named " + value + " already exists"
-      wireguard.renameConfig(profile, value)
-      return "ok"
+      return wireguard.renameConfig(profile, value) ? "ok" : "error: " + wireguard.actionRejection
     }
-    function importPick(): string { wireguard.pickConfigFile(); return "ok" }
-    function importPaste(): string { wireguard.pasteConfig(); return "ok" }
+    function importPick(): string {
+      return wireguard.pickConfigFile() ? "ok" : "error: " + wireguard.actionRejection
+    }
+    function importPaste(): string {
+      return wireguard.pasteConfig() ? "ok" : "error: " + wireguard.actionRejection
+    }
     // Headless export — no warning dialog: an explicit path in argv is
     // already deliberate in a way a panel click is not. The file lands 0600.
     function exportConfig(target: string, path: string): string {
@@ -421,8 +433,7 @@ Panel {
         profile = wireguard.findByName(target)
       }
       if (String(path || "") === "") return "error: no destination path"
-      wireguard.exportToPath(profile, path)
-      return "ok"
+      return wireguard.exportToPath(profile, path) ? "ok" : "error: " + wireguard.actionRejection
     }
     // The QR has its own window, so this never touches the panel — a
     // headless caller gets the code centred on screen and nothing else.
@@ -504,8 +515,7 @@ Panel {
         // in the way of zenity and of the rename window as it is of the QR.
         else if (t === "e" || t === "E") {
           if (root.cursorActive && root.focusSection === "configs") {
-            root.handOffToEditor(root.selectedProfile())
-            root.close()
+            if (root.handOffToEditor(root.selectedProfile())) root.close()
           }
         }
         else if (t === "n" || t === "N") {
