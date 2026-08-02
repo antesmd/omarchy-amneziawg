@@ -33,6 +33,16 @@ unreachable, which is why the failure paths live in `test-connect.sh`.
       tunnel's within a second of a switch, never the old one's.
 - [ ] Ping and packet loss stop moving when the panel closes and start
       from an empty window when it reopens — no stale samples on screen.
+      Close the panel mid-probe (within ~2s of a tick) and reopen: the first
+      frame shows `--`, never a figure from the previous session.
+- [ ] Switch tunnels while a probe is in flight — the old tunnel's latency
+      never appears in the new tunnel's window.
+- [ ] `omarchy-shell glafeara.wireguard details` with the panel closed for
+      more than ten seconds shows `--` for rates, totals and ping, and real
+      values for the addresses. Never `0 B` for a tunnel that has moved
+      megabytes.
+- [ ] A profile with two peers shows `first of 2 peers` under the grid, and
+      `details` says `peers=2 (first shown)`.
 - [ ] A split tunnel that does not route `pingHost` shows `--`, not 100%.
 - [ ] `pingHost` set to `""` drops the Ping and Packet Loss row entirely and
       spawns no `ping` process while the panel is open.

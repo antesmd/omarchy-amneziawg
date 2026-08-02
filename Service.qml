@@ -99,6 +99,14 @@ Item {
     return value === undefined ? "" : String(value)
   }
 
+  // How many peers the profile has. The endpoint and the routes on show
+  // belong to the first one, so anything above 1 means the grid is
+  // describing part of a tunnel and has to say so.
+  readonly property int peerCount: {
+    var n = parseInt(detail("peers"), 10)
+    return isFinite(n) && n > 0 ? n : 0
+  }
+
   // Latency through the tunnel: ICMP bound to the wg device, so a split
   // tunnel is measured on the path it actually routes. Unprivileged — ping
   // sockets are open to all users on Omarchy. Set pingHost to "" to switch
@@ -194,6 +202,10 @@ Item {
 
   function samplePing() {
     if (pingProcess.running || pingHost === "" || primaryDevice === "") return
+    // Tagged with the tunnel it was sent for: a probe takes up to two
+    // seconds, and a switch or a closing panel inside that window clears the
+    // samples — the reply must not land in the window that replaced them.
+    _pingFor = primaryUuid
     // The tunnel address is the fallback binding for kernels that refuse
     // SO_BINDTODEVICE to an unprivileged ping; without either, the probe
     // would measure the physical link and call it the tunnel's latency.
@@ -228,10 +240,13 @@ Item {
       // A first sample, restarted counters (the interface was recreated
       // behind our back) or a gap left by a closed panel all make the delta
       // meaningless: keep the totals, hold the rate at zero for one tick.
+      // `rated` marks a rate that was actually measured: the zero a first
+      // sample carries means "no interval yet", and reporting that as
+      // 0 B/s claims an idle tunnel on no evidence.
       if (!prev || rx < prev.rx || tx < prev.tx || dt <= 0 || dt > 30) {
-        next[dev] = { rx: rx, tx: tx, at: now, rxRate: 0, txRate: 0 }
+        next[dev] = { rx: rx, tx: tx, at: now, rxRate: 0, txRate: 0, rated: false }
       } else {
-        next[dev] = { rx: rx, tx: tx, at: now,
+        next[dev] = { rx: rx, tx: tx, at: now, rated: true,
           rxRate: (rx - prev.rx) / dt, txRate: (tx - prev.tx) / dt }
       }
     }
@@ -284,29 +299,55 @@ Item {
   // the first sample lands.
   function trafficOf(dev) {
     var t = traffic[String(dev || "")]
-    return t ? t : { rx: 0, tx: 0, at: 0, rxRate: 0, txRate: 0 }
+    return t ? t : { rx: 0, tx: 0, at: 0, rxRate: 0, txRate: 0, rated: false }
+  }
+
+  // Sampling stops with the panel, so a stored sample is only worth printing
+  // for as long as it can still be true. Past that the honest answer is
+  // "--": zeros would claim a tunnel that has moved nothing, and the last
+  // rate would claim traffic that stopped being measured minutes ago.
+  readonly property int trafficStaleMs: 10000
+
+  function trafficLive(t) {
+    return !!t && t.at > 0 && (Date.now() - t.at) <= trafficStaleMs
+  }
+
+  function trafficTotal(dev, key) {
+    var t = trafficOf(dev)
+    return trafficLive(t) ? fmtSize(t[key]) : "--"
+  }
+
+  function trafficRate(dev, key) {
+    var t = trafficOf(dev)
+    return trafficLive(t) && t.rated ? fmtRate(t[key]) : "--"
   }
 
   // The panel's grid as one line, for scripts and for anyone who would
   // rather not open a popup to read six numbers.
   function detailsText() {
     if (!active) return "VPN disconnected"
-    var t = trafficOf(primaryDevice)
     var parts = [primaryName]
     parts.push("ip=" + (detail("ip") !== "" ? detail("ip") : (detail("ip6") !== "" ? detail("ip6") : "--")))
     parts.push("endpoint=" + (detail("endpoint") !== "" ? detail("endpoint") : "--"))
     parts.push("allowed=" + (detail("allowed") !== "" ? detail("allowed") : "--"))
     parts.push("dns=" + (detail("dns") !== "" ? detail("dns") : "--"))
-    parts.push("rx=" + fmtSize(t.rx) + " (" + fmtRate(t.rxRate) + ")")
-    parts.push("tx=" + fmtSize(t.tx) + " (" + fmtRate(t.txRate) + ")")
+    // Counters are sampled only while the panel is open, so a headless
+    // caller usually gets "--" here rather than a total from whenever it
+    // was last looked at. peers says how much of the tunnel the endpoint
+    // and the routes above actually describe.
+    parts.push("rx=" + trafficTotal(primaryDevice, "rx") + " (" + trafficRate(primaryDevice, "rxRate") + ")")
+    parts.push("tx=" + trafficTotal(primaryDevice, "tx") + " (" + trafficRate(primaryDevice, "txRate") + ")")
     parts.push("ping=" + fmtPing(pingLatency) + " loss=" + fmtLoss(pingLoss))
+    if (peerCount > 1) parts.push("peers=" + peerCount + " (first shown)")
     return parts.join(" · ")
   }
 
-  // One caption line: current rate, then session totals.
+  // One caption line: current rate, then session totals. Empty until there
+  // is something live to say — the row falls back to its plain state text,
+  // which beats a line of stale numbers.
   function trafficLine(dev) {
     var t = traffic[String(dev || "")]
-    if (!t) return ""
+    if (!trafficLive(t)) return ""
     return "↓ " + fmtBytes(t.rxRate) + "/s ↑ " + fmtBytes(t.txRate) + "/s"
       + " · ↓ " + fmtBytes(t.rx) + " ↑ " + fmtBytes(t.tx)
   }
@@ -812,8 +853,9 @@ Item {
   property string _exportDest: ""
   // The UUID the running details query is about — the answer is filed under
   // it, so a query overtaken by a switch cannot label itself with the new
-  // tunnel's UUID.
+  // tunnel's UUID. _pingFor does the same for the probe in flight.
   property string _detailsFor: ""
+  property string _pingFor: ""
   // uuid -> name of the profiles active at the previous status poll.
   property var _prevActive: ({})
   property string _notifyDropName: ""
@@ -1178,6 +1220,11 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      // The tunnel moved, or the panel closed and emptied the window, while
+      // this probe was in flight: its answer belongs to neither.
+      var stale = root._pingFor !== root.primaryUuid || !root.trafficMonitoring
+      root._pingFor = ""
+      if (stale) return
       if (exitCode === 1) {
         root.addPingSample(-1)
         return

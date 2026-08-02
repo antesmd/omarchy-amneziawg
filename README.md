@@ -96,9 +96,15 @@ the routes it claims and the DNS it sets. Those last four copy on click, and
 a value too long for its cell shows in full in the tooltip rather than
 staying behind an ellipsis. Everything but the ping is read from
 NetworkManager and `/sys`,
-and the whole block is live only while the panel is open. The numbers are
-activity, not health: WireGuard has no connection state, and an idle tunnel
-is not a broken one.
+and the whole block is live only while the panel is open — a sampled figure
+with nothing behind it yet, or nothing behind it any more, reads `--`
+rather than `0 B/s`. The numbers are activity, not health: WireGuard has no
+connection state, and an idle tunnel is not a broken one.
+
+The endpoint and the routes belong to the profile's **first peer**. Most
+tunnels have exactly one; a profile with several says so under the grid
+(`first of 3 peers`), because one endpoint line cannot describe a
+site-to-site setup and should not pretend to.
 
 Nothing in this widget can bring up two tunnels at once — switching is
 exclusive — but `nmcli`, another applet or a profile with autoconnect can.
@@ -207,8 +213,10 @@ omarchy-shell glafeara.wireguard qr kz                   # QR window, centred on
 
 Name-based commands refuse an ambiguous name and list the matching UUIDs
 instead — pass a UUID to disambiguate. `details` answers with the addresses
-and the session totals whether or not the panel is open, and with `--` for
-the rate and ping figures, which are only sampled while it is.
+whether or not the panel is open, and with `--` for everything sampled —
+rates, totals and ping — because sampling stops with the panel. A figure
+older than ten seconds reads `--` too: a stale total is a wrong total, not
+an old one.
 
 ## What it touches
 

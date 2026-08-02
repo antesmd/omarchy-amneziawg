@@ -632,10 +632,19 @@ Panel {
             width: parent.width - Style.space(6)
             spacing: Style.spacing.labelGap
 
+            // Says what the grid leaves out, and only when it leaves
+            // something out: which tunnel it picked when several are up, and
+            // that the endpoint and routes below belong to the first peer of
+            // a profile that has more than one.
             Text {
-              visible: wireguard.activeNames.length > 1
+              visible: text !== ""
               width: parent.width
-              text: "Showing " + wireguard.primaryName
+              text: {
+                var notes = []
+                if (wireguard.activeNames.length > 1) notes.push("Showing " + wireguard.primaryName)
+                if (wireguard.peerCount > 1) notes.push("first of " + wireguard.peerCount + " peers")
+                return notes.join(" · ")
+              }
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -670,24 +679,27 @@ Panel {
                 valueColor: wireguard.pingLoss > 0 ? root.urgent : root.foreground
               }
 
+              // "--" until a rate has actually been measured: the first
+              // sample of a session has no interval behind it, and printing
+              // its zero would claim an idle tunnel on no evidence.
               DetailPair {
                 label: "Receiving"
-                value: wireguard.fmtRate(wireguard.trafficOf(wireguard.primaryDevice).rxRate)
+                value: wireguard.trafficRate(wireguard.primaryDevice, "rxRate")
               }
               DetailPair {
                 label: "Sending"
-                value: wireguard.fmtRate(wireguard.trafficOf(wireguard.primaryDevice).txRate)
+                value: wireguard.trafficRate(wireguard.primaryDevice, "txRate")
               }
 
               // Session totals, not lifetime ones: NetworkManager creates the
               // wg interface at activation, so its counters start at zero.
               DetailPair {
                 label: "Downloaded"
-                value: wireguard.fmtSize(wireguard.trafficOf(wireguard.primaryDevice).rx)
+                value: wireguard.trafficTotal(wireguard.primaryDevice, "rx")
               }
               DetailPair {
                 label: "Uploaded"
-                value: wireguard.fmtSize(wireguard.trafficOf(wireguard.primaryDevice).tx)
+                value: wireguard.trafficTotal(wireguard.primaryDevice, "tx")
               }
 
               DetailPair {
