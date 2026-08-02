@@ -517,6 +517,31 @@ Panel {
         }
       }
 
+      // The row highlight is the keyboard cursor, and only a cursor target
+      // ever moved it — so leaving a row for the hero or the CONFIGS header
+      // changed nothing and the row it left stayed lit. This sink lies under
+      // the whole panel and takes the hover the instant no cursor target
+      // holds it, which is exactly "the pointer left the list". Rows and
+      // buttons sit above it and keep their hover, so a row holds its cursor
+      // while the pointer is on its own actions. NoButton so clicks still
+      // reach the items above it.
+      MouseArea {
+        anchors.fill: parent
+        acceptedButtons: Qt.NoButton
+        hoverEnabled: true
+        onEntered: root.cursorActive = false
+      }
+
+      // The sink catches an exit that lands somewhere else in the panel; it
+      // cannot catch one that lands nowhere. A pointer leaving the window
+      // from a row enters nothing, so the row it left kept the cursor and
+      // stayed lit under a pointer that was gone. A non-blocking handler,
+      // hovered for the whole panel: rows and buttons below it keep their
+      // own hover, and this only goes false when the pointer is out.
+      HoverHandler {
+        onHoveredChanged: if (!hovered) root.cursorActive = false
+      }
+
       Flickable {
         id: panelFlick
         anchors.fill: parent
@@ -763,6 +788,10 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
 
+                // These two are not cursor targets, but they are the one thing
+                // close enough to the first row that a fast pointer can reach
+                // them without ever crossing the sink below. Drop the cursor
+                // here too, or that row stays lit while the pointer is here.
                 PanelActionButton {
                   iconText: "󰐕"
                   tooltipText: "Import a .conf file (i)"
@@ -770,6 +799,7 @@ Panel {
                   hoverColor: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !wireguard.busy
+                  onHovered: function(on) { if (on) root.cursorActive = false }
                   onClicked: wireguard.pickConfigFile()
                 }
 
@@ -780,6 +810,7 @@ Panel {
                   hoverColor: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !wireguard.busy
+                  onHovered: function(on) { if (on) root.cursorActive = false }
                   onClicked: wireguard.pasteConfig()
                 }
               }
