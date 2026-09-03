@@ -56,6 +56,14 @@ set -f
 export LC_ALL=C
 umask 077
 
+# Hard bounds on config text — inputs and outputs on this path must not be
+# unbounded, whether they come from the clipboard, a picked file, the editor
+# or the helper. Kept in step with the helper's own limits.
+MAX_CONF_BYTES=131072
+MAX_CONF_LINES=2000
+MAX_PEERS=64
+MAX_VALUE_LEN=4096
+
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed"; }
@@ -90,18 +98,38 @@ PRIV() {
 
 RUNTIME_DIR=""
 
+# Every directory this script keeps state in must be a real directory we own,
+# reached without following a symlink, and unreadable by anyone else — the
+# files inside are private keys, or point at them.
+#
+# <fix> is for directories this script creates itself: a loose mode is
+# tightened to 0700 rather than refused, because refusing would strand a user
+# whose ~/.local/state predates us. A directory we did NOT create (the runtime
+# dir, handed to us by the session) is only ever checked — a loose mode there
+# is somebody else's decision and a red flag, not ours to paper over.
+ensure_private_dir() { # <dir> <label> [fix]
+  local dir="$1" label="$2" fix="${3:-}" mode
+  [ -n "$dir" ] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ] ||
+    die "A private $label is required for AmneziaWG state"
+  mode="$(stat -Lc '%a' -- "$dir" 2>/dev/null)" || die "Cannot inspect $label"
+  case "$mode" in
+    ''|*[!0-7]*) die "$label has unsafe permissions" ;;
+  esac
+  if [ $((8#$mode & 0077)) -ne 0 ]; then
+    [ "$fix" = fix ] || die "$label has unsafe permissions"
+    chmod 700 -- "$dir" || die "Cannot tighten the permissions on $label"
+    mode="$(stat -Lc '%a' -- "$dir" 2>/dev/null)" || die "Cannot inspect $label"
+    case "$mode" in
+      ''|*[!0-7]*) die "$label has unsafe permissions" ;;
+    esac
+    [ $((8#$mode & 0077)) -eq 0 ] || die "$label has unsafe permissions"
+  fi
+}
+
 ensure_runtime_dir() {
   [ -n "$RUNTIME_DIR" ] && return 0
-  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" mode
-  [ -n "$dir" ] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ] ||
-    die "A private XDG_RUNTIME_DIR is required for AmneziaWG state"
-  mode="$(stat -Lc '%a' -- "$dir" 2>/dev/null)" ||
-    die "Cannot inspect XDG_RUNTIME_DIR"
-  case "$mode" in
-    ''|*[!0-7]*) die "XDG_RUNTIME_DIR has unsafe permissions" ;;
-  esac
-  [ $((8#$mode & 0077)) -eq 0 ] ||
-    die "XDG_RUNTIME_DIR has unsafe permissions"
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  ensure_private_dir "$dir" "XDG_RUNTIME_DIR"
   RUNTIME_DIR="$dir"
 }
 
@@ -123,7 +151,10 @@ names_file() {
 ensure_state_dir() {
   local d
   d="$(dirname -- "$(names_file)")"
-  [ -d "$d" ] || mkdir -p -- "$d" || die "Cannot create $d"
+  # 0700 at creation, and verified afterwards either way: the sidecar and the
+  # last-tunnel marker name the tunnels this user runs.
+  [ -d "$d" ] || mkdir -p -m 700 -- "$d" || die "Cannot create $d"
+  ensure_private_dir "$d" "the state directory" fix
 }
 
 # ---------------------------------------------------------------------------
@@ -248,10 +279,15 @@ cmd_status() {
   declare -A LABELS
   local f i l
   f="$(names_file)"
-  if [ -f "$f" ]; then
+  # Labels are cosmetic: a sidecar that is a symlink or not a regular file is
+  # skipped with a warning rather than failing the listing, and the read is
+  # bounded — this text flows straight into the panel.
+  if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then
+    printf 'Ignoring the name sidecar: %s is not a regular file\n' "$f" >&2
+  elif [ -f "$f" ]; then
     while IFS=$'\t' read -r i l || [ -n "$i" ]; do
       [ -n "$i" ] && LABELS[$i]="$l"
-    done < "$f"
+    done < <(head -c "$MAX_CONF_BYTES" -- "$f")
   fi
 
   local iface dev label
@@ -383,16 +419,19 @@ sidecar_rewrite() { # <iface> <label|"">   ("" deletes the line)
   local iface="$1" label="$2" f keep="" ln tmp
   f="$(names_file)"
   ensure_state_dir
+  [ -L "$f" ] && die "The name sidecar is a symlink: $f"
+  [ -e "$f" ] && [ ! -f "$f" ] && die "The name sidecar is not a regular file: $f"
   if [ -f "$f" ]; then
     while IFS= read -r ln || [ -n "$ln" ]; do
       [ -n "$ln" ] || continue
       case "$ln" in "$iface"$'\t'*) continue ;; esac
       keep="$keep$ln"$'\n'
-    done < "$f"
+    done < <(head -c "$MAX_CONF_BYTES" -- "$f")
   fi
   [ -n "$label" ] && keep="$keep$iface"$'\t'"$label"$'\n'
   tmp="$(mktemp -- "$f.XXXXXX")" || die "Cannot write the name sidecar"
-  printf '%s' "$keep" > "$tmp" && mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; die "Cannot write the name sidecar"; }
+  printf '%s' "$keep" > "$tmp" && chmod 600 -- "$tmp" &&
+    mv -f -- "$tmp" "$f" || { rm -f -- "$tmp"; die "Cannot write the name sidecar"; }
 }
 
 drop_label() { # best-effort
@@ -455,9 +494,10 @@ flush_peer() {
 }
 
 parse_config() {
-  local section="" lineno=0 line key value item canon
+  local section="" lineno=0 line key value item canon peers=0
   while IFS= read -r line || [ -n "$line" ]; do
     lineno=$((lineno + 1))
+    [ "$lineno" -le "$MAX_CONF_LINES" ] || die "Config has too many lines (max $MAX_CONF_LINES)"
     line="${line%%#*}"
     line="$(trim "$line")"
     [ -z "$line" ] && continue
@@ -465,7 +505,10 @@ parse_config() {
       value="${line#[}"; value="${value%]}"
       case "${value,,}" in
         interface) flush_peer; section=interface ;;
-        peer) flush_peer; section=peer ;;
+        peer)
+          flush_peer; section=peer
+          peers=$((peers + 1))
+          [ "$peers" -le "$MAX_PEERS" ] || die "Config has too many [Peer] sections (max $MAX_PEERS)" ;;
         *) die "Unknown section [$value] on line $lineno" ;;
       esac
       continue
@@ -474,6 +517,7 @@ parse_config() {
     value="$(trim "${line#*=}")"
     [ "$key" = "$line" ] && die "Line $lineno is not 'Key = value'"
     [ -n "$value" ] || die "$key on line $lineno has no value"
+    [ "${#value}" -le "$MAX_VALUE_LEN" ] || die "$key on line $lineno has an over-long value"
     case "$section" in
       interface)
         case "${key,,}" in
@@ -594,11 +638,17 @@ cmd_import() {
   if [ -n "$old" ]; then
     valid_iface "$old" || die "Invalid interface name: $old"
   fi
+  local raw
   if [ -n "$src" ]; then
     [ -f "$src" ] || die "No such file: $src"
-    exec < "$src"
+    [ "$(wc -c < "$src")" -le "$MAX_CONF_BYTES" ] ||
+      die "Config file is too large (max $MAX_CONF_BYTES bytes)"
+    raw="$(head -c "$((MAX_CONF_BYTES + 1))" < "$src")"
+  else
+    raw="$(head -c "$((MAX_CONF_BYTES + 1))")"
   fi
-  parse_config
+  [ "${#raw}" -le "$MAX_CONF_BYTES" ] || die "Config is too large (max $MAX_CONF_BYTES bytes)"
+  parse_config <<< "$raw"
   local body
   body="$(emit_conf)"
 
@@ -661,6 +711,7 @@ cmd_export() {
   local iface="$1" conf
   valid_iface "$iface" || die "Invalid interface name: $iface"
   conf="$(PRIV getconf "$iface")" || die "Could not read the tunnel config"
+  [ "${#conf}" -le "$MAX_CONF_BYTES" ] || die "Stored config is too large (max $MAX_CONF_BYTES bytes)"
   printf '%s\n' "$conf" | awk '
     /^[[:space:]]*$/ { print ""; next }
     /^[[:space:]]*[#;]/ { sub(/^[ \t]+/, ""); print; next }
@@ -678,6 +729,7 @@ cmd_export() {
 cmd_export_file() {
   local iface="$1" dest="$2" dir tmp
   [ -n "$dest" ] || die "No destination path"
+  [ -L "$dest" ] && die "Destination is a symlink: $dest"
   [ -d "$dest" ] && die "Destination is a directory: $dest"
   [ -e "$dest" ] && [ ! -f "$dest" ] && die "Destination is not a regular file: $dest"
   dir="$(dirname -- "$dest")"
@@ -728,7 +780,8 @@ cmd_cleanup_runtime() {
 
 cmd_edit() {
   local iface="$1" name="$2" seed src dir tmp buf
-  seed="$(cat)"
+  seed="$(head -c "$((MAX_CONF_BYTES + 1))")"
+  [ "${#seed}" -le "$MAX_CONF_BYTES" ] || exit 3   # an over-long seed is not a config
   command -v zenity >/dev/null 2>&1 || exit 2
   src="$(cmd_export "$iface")" || exit 1
   ensure_runtime_dir
@@ -741,6 +794,7 @@ cmd_edit() {
   else printf '%s\n' "$src" > "$buf"; fi
   zenity --text-info --editable --filename="$buf" \
     --title="Edit $name" --width=700 --height=560 > "$tmp" || exit 3
+  [ "$(wc -c < "$tmp")" -le "$MAX_CONF_BYTES" ] || exit 3   # editor produced an over-long buffer
   printf '%s\n' "$src" | cmp -s "$tmp" - && exit 4
   cat -- "$tmp"
 }
