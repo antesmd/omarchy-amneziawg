@@ -6,7 +6,7 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 backend="$here/../backend.sh"
 export PATH="$here/fake:$PATH"
-export OMAWG_PRIV=direct OMAWG_HELPER="$here/fake/helper"
+export OMAWG_PRIV=direct OMAWG_HELPER="$here/fake/helper" OMAWG_HELPER_SECRETS="$here/fake/helper"
 export FAKE_DIR="$(mktemp -d)"
 export XDG_RUNTIME_DIR="$FAKE_DIR"
 export XDG_STATE_HOME="$FAKE_DIR/state"

@@ -2,4 +2,11 @@
 # Install to /etc/sudoers.d/omarchy-amneziawg (mode 0440) and run the backend
 # with OMAWG_PRIV=sudo. Lets any wheel user invoke the AmneziaWG root helper
 # (itself a tight verb allowlist) without a password.
+#
+# The pkexec path is preferred: there the secret-bearing and destructive
+# verbs (getconf/writeconf/delconf, via the -secrets entry point) prompt for
+# authentication even on an active session. This sudoers drop-in cannot make
+# that distinction, so it stays fully passwordless for wheel — use it only
+# where polkit is not an option.
 %wheel ALL=(root) NOPASSWD: /usr/local/lib/omarchy-amneziawg-helper
+%wheel ALL=(root) NOPASSWD: /usr/local/lib/omarchy-amneziawg-helper-secrets

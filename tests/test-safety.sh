@@ -6,7 +6,7 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 backend="$here/../backend.sh"
 export PATH="$here/fake:$PATH"
-export OMAWG_PRIV=direct OMAWG_HELPER="$here/fake/helper"
+export OMAWG_PRIV=direct OMAWG_HELPER="$here/fake/helper" OMAWG_HELPER_SECRETS="$here/fake/helper"
 pass=0 fail=0
 
 fresh() {
@@ -38,6 +38,58 @@ bash "$backend" export-file missing "$FAKE_DIR/dest.conf" >/dev/null 2>&1; file_
 done_case "failed export fails and never overwrites the destination" \
   '[ "$export_rc" != 0 ] && [ "$file_rc" != 0 ] && [ "$(cat "$FAKE_DIR/dest.conf")" = unchanged ]'
 
+# --- export-file refuses a symlinked destination -------------------------
+fresh
+confbody | bash "$backend" import wg0 >/dev/null 2>&1
+printf 'secret-target' > "$FAKE_DIR/outside"
+ln -s "$FAKE_DIR/outside" "$FAKE_DIR/dest-link"
+bash "$backend" export-file wg0 "$FAKE_DIR/dest-link" >/dev/null 2>&1; link_rc=$?
+done_case "export-file refuses a symlinked destination and never follows it" \
+  '[ "$link_rc" != 0 ] && [ "$(cat "$FAKE_DIR/outside")" = secret-target ] && [ -L "$FAKE_DIR/dest-link" ]'
+
+# --- rename refuses a symlinked name sidecar ----------------------------
+fresh
+mkdir -p "$XDG_STATE_HOME/omarchy"
+printf 'attacker' > "$FAKE_DIR/sidecar-target"
+ln -s "$FAKE_DIR/sidecar-target" "$(names_file)"
+bash "$backend" rename wg0 "Label" >/dev/null 2>&1; sc_rc=$?
+done_case "rename refuses a symlinked name sidecar" \
+  '[ "$sc_rc" != 0 ] && [ "$(cat "$FAKE_DIR/sidecar-target")" = attacker ]'
+rm -f "$(names_file)"
+
+# --- status ignores a hostile sidecar instead of reading it --------------
+fresh
+confbody | bash "$backend" import wg0 >/dev/null 2>&1
+mkdir -p "$XDG_STATE_HOME/omarchy"
+printf 'wg0\tPlanted\n' > "$FAKE_DIR/sidecar-target"
+ln -s "$FAKE_DIR/sidecar-target" "$(names_file)"
+status_out="$(bash "$backend" status 2>/dev/null)"; status_rc=$?
+done_case "status skips a symlinked name sidecar and still lists tunnels" \
+  '[ "$status_rc" = 0 ] && printf "%s" "$status_out" | grep -q wg0 \
+    && ! printf "%s" "$status_out" | grep -q Planted'
+rm -f "$(names_file)"
+
+# --- the state directory must be private ---------------------------------
+fresh
+mkdir -p "$FAKE_DIR/elsewhere"
+mkdir -p "$XDG_STATE_HOME"
+ln -s "$FAKE_DIR/elsewhere" "$XDG_STATE_HOME/omarchy"
+bash "$backend" rename wg0 "Label" >/dev/null 2>&1; state_link_rc=$?
+rm -f "$XDG_STATE_HOME/omarchy"
+# A pre-existing loose mode is tightened rather than refused: the directory is
+# ours, and refusing would strand anyone whose ~/.local/state predates us.
+mkdir -p "$XDG_STATE_HOME/omarchy"; chmod 755 "$XDG_STATE_HOME/omarchy"
+confbody | bash "$backend" import wg0 >/dev/null 2>&1
+bash "$backend" rename wg0 "Label" >/dev/null 2>&1; state_fix_rc=$?
+state_mode="$(stat -Lc '%a' "$XDG_STATE_HOME/omarchy")"
+# A freshly created one is 0700 from the start.
+rm -rf "$XDG_STATE_HOME/omarchy"
+bash "$backend" rename wg0 "Other" >/dev/null 2>&1
+fresh_mode="$(stat -Lc '%a' "$XDG_STATE_HOME/omarchy" 2>/dev/null)"
+done_case "the state directory is refused when symlinked, and kept private otherwise" \
+  '[ "$state_link_rc" != 0 ] && [ "$state_fix_rc" = 0 ] && [ "$state_mode" = 700 ] \
+    && [ "$fresh_mode" = 700 ]'
+
 fresh
 confbody | bash "$backend" import wg0 >/dev/null 2>&1
 bash "$backend" export-file wg0 "$FAKE_DIR/dest.conf" >/dev/null 2>&1; good_rc=$?
@@ -58,6 +110,26 @@ fresh
 printf '%s\n' '[Interface]' 'PrivateKey = k' 'PostUp = /bin/evil' | bash "$backend" import wg0 >/dev/null 2>&1; hook_rc=$?
 done_case "a PostUp hook is rejected and nothing is written" \
   '[ "$hook_rc" != 0 ] && ! [ -e "$FAKE_DIR/conf.wg0" ]'
+
+# --- resource bounds ---------------------------------------------------
+fresh
+{ echo '[Interface]'; echo 'PrivateKey = test-private-key'; head -c 200000 /dev/zero | tr '\0' x; echo; } > "$FAKE_DIR/big.conf"
+bash "$backend" import wg0 "" "$FAKE_DIR/big.conf" >/dev/null 2>&1; big_rc=$?
+done_case "import of an oversized config file is refused" \
+  '[ "$big_rc" != 0 ] && ! [ -e "$FAKE_DIR/conf.wg0" ]'
+
+fresh
+{ echo '[Interface]'; echo 'PrivateKey = k'; for i in $(seq 1 2100); do echo "# pad $i"; done; } |
+  bash "$backend" import wg0 >/dev/null 2>&1; lines_rc=$?
+done_case "import of an over-2000-line config is refused" \
+  '[ "$lines_rc" != 0 ] && ! [ -e "$FAKE_DIR/conf.wg0" ]'
+
+fresh
+printf '[Interface]\nPrivateKey = k\n' > "$FAKE_DIR/conf.wg0"
+: > "$FAKE_DIR/slow-zenity"
+# feed an over-long seed on stdin; cmd_edit must bail before opening zenity
+head -c 200000 /dev/zero | tr '\0' x | bash "$backend" edit wg0 tunnel >/dev/null 2>&1; seed_rc=$?
+done_case "edit with an oversized seed is refused (exit 3)" '[ "$seed_rc" = 3 ]'
 
 # --- runtime dir refusal ----------------------------------------------------
 fresh

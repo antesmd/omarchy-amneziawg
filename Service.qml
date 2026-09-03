@@ -233,7 +233,7 @@ Item {
   function fetchDetails() {
     if (detailsProcess.running || inspectedIfnameEffective === "") return
     _detailsFor = inspectedIfnameEffective
-    detailsProcess.command = ["bash", backendPath, "details", inspectedIfnameEffective, inspectedDevice]
+    detailsProcess.command = backendCommand(["details", inspectedIfnameEffective, inspectedDevice])
     detailsProcess.running = true
   }
 
@@ -539,8 +539,27 @@ Item {
     var value = String(ifname || "")
     if (value === "" || value === lastIfname) return
     lastIfname = value
+    // Atomic, no-follow write into a verified private directory: the dir must
+    // be a real directory we own and nobody else can read (created 0700,
+    // tightened if it predates us), the target must not be a symlink or a
+    // special file, and the content is staged, fsynced and renamed. A hostile
+    // symlink under ~/.local/state must not turn "remember last tunnel" into
+    // an arbitrary-file overwrite. Mirrors ensure_private_dir in backend.sh.
     saveProcess.command = ["bash", "-c",
-      "mkdir -p \"$1\" && printf '%s' \"$2\" > \"$1/amneziawg-last\"",
+      "d=$1; f=$d/amneziawg-last\n" +
+      "[ -d \"$d\" ] || mkdir -p -m 700 -- \"$d\" || exit 1\n" +
+      "[ -L \"$d\" ] && exit 1\n" +
+      "[ -O \"$d\" ] || exit 1\n" +
+      "m=$(stat -Lc '%a' -- \"$d\") || exit 1\n" +
+      "case $m in ''|*[!0-7]*) exit 1 ;; esac\n" +
+      "[ $((8#$m & 0077)) -eq 0 ] || chmod 700 -- \"$d\" || exit 1\n" +
+      "[ -L \"$f\" ] && exit 1\n" +
+      "[ -e \"$f\" ] && [ ! -f \"$f\" ] && exit 1\n" +
+      "t=$(mktemp \"$d/.amneziawg-last.XXXXXX\") || exit 1\n" +
+      "trap 'rm -f \"$t\"' EXIT\n" +
+      "printf '%s' \"$2\" > \"$t\" && chmod 600 \"$t\" || exit 1\n" +
+      "command -v sync >/dev/null && sync \"$t\" 2>/dev/null || true\n" +
+      "mv -f \"$t\" \"$f\"",
       "amneziawg", stateDir, value]
     saveProcess.running = true
   }
@@ -670,7 +689,7 @@ Item {
     // and argv is world-readable via /proc.
     _editSeed = String(seedText || "")
     editProcess.stdinEnabled = true
-    editProcess.command = ["bash", backendPath, "edit", _editIfname, _editName]
+    editProcess.command = backendCommand(["edit", _editIfname, _editName])
     editProcess.running = true
     return true
   }
@@ -698,7 +717,7 @@ Item {
     lastError = ""
     _exportDest = dest
     actionStatus = "Exporting " + profile.name + "…"
-    exportProcess.command = ["bash", backendPath, "export-file", profile.ifname, dest]
+    exportProcess.command = backendCommand(["export-file", profile.ifname, dest])
     exportProcess.running = true
     return true
   }
@@ -723,7 +742,7 @@ Item {
     // has to read right while the code is still being rendered.
     qrName = String(profile.name)
     qrLoading = true
-    qrProcess.command = ["bash", backendPath, "qr-png", profile.ifname]
+    qrProcess.command = backendCommand(["qr-png", profile.ifname])
     qrProcess.running = true
     return ""
   }
@@ -758,13 +777,16 @@ Item {
   // SIGKILL and a hard shell crash cannot run the destruction handler. The
   // backend identifies PNGs by this shell's parent PID, so startup safely
   // reaps files from a dead previous shell without touching a live monitor.
-  Component.onCompleted: Quickshell.execDetached(["bash", backendPath, "cleanup-runtime"])
+  Component.onCompleted: {
+    Quickshell.execDetached(["bash", backendPath, "cleanup-runtime"])
+    lastFileProcess.running = true
+  }
 
   function _flushDrops() {
     if (notifyProcess.running || _dropQueue.length === 0) return
     var drop = _dropQueue.shift()
     _notifyDropName = drop.name
-    notifyProcess.command = ["bash", backendPath, "notify-drop", drop.ifname, drop.name]
+    notifyProcess.command = backendCommand(["notify-drop", drop.ifname, drop.name])
     notifyProcess.running = true
   }
 
@@ -876,7 +898,7 @@ Item {
     _controlOperation = String(args[0])
     _controlStdin = stdinData === undefined ? "" : String(stdinData)
     controlProcess.stdinEnabled = true
-    controlProcess.command = ["bash", backendPath].concat(args)
+    controlProcess.command = backendCommand(args)
     controlProcess.running = true
   }
 
@@ -885,23 +907,101 @@ Item {
     return value.length > 140 ? value.substring(0, 137) + "…" : value
   }
 
+  // --- process watchdog -------------------------------------------------
+  // Every Process below collects stdout/stderr with waitForEnd and clears
+  // UI state from onExited. A producer that never closes its pipe — a
+  // wedged pkexec prompt, a stuck awg-quick, a zombie zenity — would hang
+  // that collector, and the state it clears, forever. _guard arms a
+  // deadline when a process starts; on expiry the process is signalled and
+  // its normal onExited (non-zero) path runs. Every onExited calls _unguard.
+  //
+  // Termination is SIGTERM first, then SIGKILL a couple of seconds later if
+  // it is still there, so a shell holding a temp file gets to run its EXIT
+  // trap before it is shot. The signal reaches the bash child we spawned; a
+  // root descendant behind pkexec is already reparented and not ours to
+  // signal — we stop waiting on it, we cannot reap it. That is why a timeout
+  // is also reported in the UI instead of only the log: the operation may
+  // still be running as root, and the user has to know that.
+  property var _guarded: []   // [{ proc, name, deadline, killAt }]
+  function _guard(proc, name, ms) {
+    _guarded.push({ proc: proc, name: name, deadline: Date.now() + ms, killAt: 0 })
+    watchdogTimer.running = true
+  }
+  function _unguard(proc) {
+    _guarded = _guarded.filter(function(g) { return g.proc !== proc })
+  }
+
+  Timer {
+    id: watchdogTimer
+    interval: 1000
+    repeat: true
+    running: false
+    onTriggered: {
+      var now = Date.now()
+      var live = []
+      for (var i = 0; i < root._guarded.length; i++) {
+        var g = root._guarded[i]
+        if (now < g.deadline) { live.push(g); continue }
+        if (!g.proc.running) continue
+        if (g.killAt === 0) {
+          console.warn("omarchy-amneziawg: " + g.name + " exceeded its deadline; terminating")
+          root.lastError = g.name + " timed out and was stopped"
+          g.proc.signal(15)
+          g.killAt = now + 2000
+          live.push(g)
+          continue
+        }
+        if (now < g.killAt) { live.push(g); continue }
+        console.warn("omarchy-amneziawg: " + g.name + " ignored SIGTERM; killing")
+        g.proc.signal(9)
+        g.proc.running = false
+      }
+      root._guarded = live
+      if (live.length === 0) running = false
+    }
+  }
+
   // Everything that touches AmneziaWG lives in backend.sh — status,
   // connect, down, delete, import (with the awg-quick parser) and the
   // editor round-trip. Only the desktop-integration helpers below stay
   // inline.
 
+  // Nothing this widget reads is anywhere near 128 KiB: a config is a few KB,
+  // a status listing a few hundred bytes, a path a few dozen. Cap every
+  // producer at the source so a runaway or hostile one cannot grow a
+  // StdioCollector without bound.
+  readonly property int maxOutputBytes: 131072
+
+  // backend.sh under that cap, with its exit code preserved — the control and
+  // editor paths read 2..6 as distinct outcomes, so the pipeline must report
+  // the backend's status, not head's. stderr is left alone: it carries only
+  // this project's own die() strings, themselves bounded by the config limits.
+  readonly property string backendScript:
+    "set -o pipefail\n" +
+    "be=\"$1\"; shift\n" +
+    "bash \"$be\" \"$@\" | head -c " + maxOutputBytes + "\n"
+
+  function backendCommand(args) {
+    return ["bash", "-c", backendScript, "amneziawg", backendPath].concat(args)
+  }
+
   // Exit 2 means "no picker installed" — distinct from the user pressing
   // Cancel, which every one of these exits non-zero for.
   readonly property string pickScript:
-    "if command -v zenity >/dev/null 2>&1; then\n" +
-    "  exec zenity --file-selection --title='Import AmneziaWG config' \\\n" +
-    "    --file-filter='AmneziaWG config | *.conf' --file-filter='All files | *'\n" +
-    "elif command -v kdialog >/dev/null 2>&1; then\n" +
-    "  exec kdialog --getopenfilename \"$HOME\" '*.conf|AmneziaWG config'\n" +
-    "elif command -v yad >/dev/null 2>&1; then\n" +
-    "  exec yad --file --title='Import AmneziaWG config'\n" +
-    "fi\n" +
-    "exit 2\n"
+    "pick() {\n" +
+    "  if command -v zenity >/dev/null 2>&1; then\n" +
+    "    zenity --file-selection --title='Import AmneziaWG config' \\\n" +
+    "      --file-filter='AmneziaWG config | *.conf' --file-filter='All files | *'\n" +
+    "  elif command -v kdialog >/dev/null 2>&1; then\n" +
+    "    kdialog --getopenfilename \"$HOME\" '*.conf|AmneziaWG config'\n" +
+    "  elif command -v yad >/dev/null 2>&1; then\n" +
+    "    yad --file --title='Import AmneziaWG config'\n" +
+    "  else\n" +
+    "    exit 2\n" +
+    "  fi\n" +
+    "}\n" +
+    "set -o pipefail\n" +
+    "pick | head -c 4096\n"
 
   // Device names come from the kernel — no spaces, no globs to worry about.
   readonly property string trafficScript:
@@ -909,7 +1009,7 @@ Item {
     "  s=\"/sys/class/net/$d/statistics\"\n" +
     "  [ -r \"$s/rx_bytes\" ] && [ -r \"$s/tx_bytes\" ] || continue\n" +
     "  printf '%s %s %s\\n' \"$d\" \"$(cat \"$s/rx_bytes\")\" \"$(cat \"$s/tx_bytes\")\"\n" +
-    "done\n"
+    "done | head -c 4096\n"
 
   // ping bound to the tunnel device, falling back to the tunnel address:
   // iputils exits 2 for "could not even send" (no such device, a bind the
@@ -927,11 +1027,14 @@ Item {
     "  out=\"$(ping -n -q -c 1 -W 2 -I \"$src\" -- \"$host\" 2>/dev/null)\" || rc=$?\n" +
     "fi\n" +
     "[ \"$rc\" = 0 ] || exit \"$rc\"\n" +
-    "printf '%s\\n' \"$out\" | awk -F/ '/^rtt|^round-trip/ {print $5; exit}'\n"
+    "printf '%s\\n' \"$out\" | awk -F/ '/^rtt|^round-trip/ {print $5; exit}' | head -c 256\n"
 
+  // A config is a few KB; anything past the cap is not one, and an unbounded
+  // clipboard should not be slurped into the collector.
   readonly property string clipboardScript:
     "command -v wl-paste >/dev/null 2>&1 || exit 2\n" +
-    "wl-paste --no-newline --type text/plain 2>/dev/null || wl-paste --no-newline\n"
+    "{ wl-paste --no-newline --type text/plain 2>/dev/null || wl-paste --no-newline; } | head -c " +
+      maxOutputBytes + "\n"
 
   property string _controlError: ""
   // Which backend command controlProcess is running: special exit codes
@@ -990,12 +1093,34 @@ Item {
   property string _editRetryName: ""
   property string _editRetryText: ""
 
-  FileView {
-    path: root.lastFile
-    printErrors: false
-    onLoaded: {
-      var value = String(text() || "").trim()
-      if (value !== "" && root.lastIfname === "") root.lastIfname = value
+  // The last-tunnel marker is read through a shell rather than a FileView:
+  // FileView follows a symlink and reads whatever it finds, whole. This
+  // refuses a symlink or a non-regular file outright and reads at most one
+  // interface name's worth of bytes, so a planted link cannot make the widget
+  // slurp an arbitrary file. The content is validated on top of that.
+  readonly property string lastFileScript:
+    "f=$1\n" +
+    "[ -L \"$f\" ] && exit 1\n" +
+    "[ -f \"$f\" ] || exit 1\n" +
+    "head -c 32 -- \"$f\"\n"
+
+  Process {
+    id: lastFileProcess
+    running: false
+    command: ["bash", "-c", root.lastFileScript, "amneziawg", root.lastFile]
+    onStarted: root._guard(lastFileProcess, "last-tunnel marker", 5000)
+    stdout: StdioCollector {
+      id: lastFileStdout
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root._unguard(lastFileProcess)
+      if (exitCode !== 0) return
+      // Accept only a single well-formed interface name (the conf-basename
+      // grammar), so a tampered marker cannot flow downstream as an "ifname".
+      var value = String(lastFileStdout.text || "").trim()
+      if (!/^[A-Za-z0-9_=+.-]{1,15}$/.test(value)) return
+      if (root.lastIfname === "") root.lastIfname = value
     }
   }
 
@@ -1053,7 +1178,8 @@ Item {
   Process {
     id: statusProcess
     running: false
-    command: ["bash", root.backendPath, "status"]
+    command: root.backendCommand(["status"])
+    onStarted: root._guard(statusProcess, "status", 30000)
     stdout: StdioCollector {
       id: statusStdout
       waitForEnd: true
@@ -1063,6 +1189,7 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(statusProcess)
       // A failed poll must not read as "disconnected" — keep the last known
       // state and say why it could not be refreshed.
       if (exitCode === 0) {
@@ -1084,11 +1211,13 @@ Item {
     id: pickerProcess
     running: false
     command: ["bash", "-c", root.pickScript, "amneziawg"]
+    onStarted: root._guard(pickerProcess, "file picker", 600000)
     stdout: StdioCollector {
       id: pickerStdout
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(pickerProcess)
       root.actionStatus = ""
       if (exitCode === 2) {
         root.lastError = "No file picker found — install zenity, kdialog or yad"
@@ -1110,12 +1239,14 @@ Item {
       if (root._editSeed !== "") write(root._editSeed)
       root._editSeed = ""
       stdinEnabled = false
+      root._guard(editProcess, "editor", 600000)
     }
     stdout: StdioCollector {
       id: editStdout
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(editProcess)
       var ifname = root._editIfname
       var name = root._editName
       root._editIfname = ""
@@ -1156,11 +1287,13 @@ Item {
     id: clipboardProcess
     running: false
     command: ["bash", "-c", root.clipboardScript, "amneziawg"]
+    onStarted: root._guard(clipboardProcess, "clipboard import", 20000)
     stdout: StdioCollector {
       id: clipboardStdout
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(clipboardProcess)
       root.actionStatus = ""
       if (exitCode === 2) {
         root.lastError = "wl-clipboard is not installed"
@@ -1185,11 +1318,13 @@ Item {
     id: exportProcess
     running: false
     command: []
+    onStarted: root._guard(exportProcess, "export", 120000)
     stderr: StdioCollector {
       id: exportStderr
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(exportProcess)
       var dest = root._exportDest
       root._exportDest = ""
       if (exitCode === 0) {
@@ -1207,6 +1342,7 @@ Item {
     id: qrProcess
     running: false
     command: []
+    onStarted: root._guard(qrProcess, "QR render", 120000)
     stdout: StdioCollector {
       id: qrStdout
       waitForEnd: true
@@ -1216,6 +1352,7 @@ Item {
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(qrProcess)
       root.qrLoading = false
       var path = exitCode === 0 ? String(qrStdout.text || "").trim() : ""
       // The window closed while we rendered: nobody is waiting for this, and
@@ -1237,7 +1374,9 @@ Item {
     id: notifyProcess
     running: false
     command: []
+    onStarted: root._guard(notifyProcess, "notify-drop", 20000)
     onExited: function(exitCode) {
+      root._unguard(notifyProcess)
       var name = root._notifyDropName
       root._notifyDropName = ""
       // 0 = the backend judged the drop external. The message lands in
@@ -1252,7 +1391,9 @@ Item {
     id: markActiveProcess
     running: false
     command: []
+    onStarted: root._guard(markActiveProcess, "mark-active", 30000)
     onExited: function(exitCode) {
+      root._unguard(markActiveProcess)
       if (exitCode === 0) {
         root._markInFlight = []
         // Drain whatever queued while this batch ran.
@@ -1270,11 +1411,13 @@ Item {
     id: trafficProcess
     running: false
     command: []
+    onStarted: root._guard(trafficProcess, "traffic", 20000)
     stdout: StdioCollector {
       id: trafficStdout
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(trafficProcess)
       if (exitCode === 0) root.applyTraffic(trafficStdout.text)
     }
   }
@@ -1283,11 +1426,13 @@ Item {
     id: detailsProcess
     running: false
     command: []
+    onStarted: root._guard(detailsProcess, "details", 30000)
     stdout: StdioCollector {
       id: detailsStdout
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(detailsProcess)
       // A failure says nothing in lastError: this is a decoration on a panel
       // whose actual job — listing and switching tunnels — is unaffected,
       // and the grid already reads "--" with no data.
@@ -1307,11 +1452,13 @@ Item {
     id: pingProcess
     running: false
     command: []
+    onStarted: root._guard(pingProcess, "ping", 20000)
     stdout: StdioCollector {
       id: pingStdout
       waitForEnd: true
     }
     onExited: function(exitCode) {
+      root._unguard(pingProcess)
       // The tunnel moved, or the panel closed and emptied the window, while
       // this probe was in flight: its answer belongs to neither.
       var stale = root._pingFor !== root.inspectedIfnameEffective || !root.trafficMonitoring
@@ -1336,6 +1483,9 @@ Item {
       if (root._controlStdin !== "") write(root._controlStdin)
       root._controlStdin = ""
       stdinEnabled = false
+      // Generous: a real awg-quick up/down plus a pkexec auth prompt can
+      // legitimately take a while; this only catches a wedged one.
+      root._guard(controlProcess, "control", 300000)
     }
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector {
@@ -1344,6 +1494,7 @@ Item {
       onStreamFinished: root._controlError = text
     }
     onExited: function(exitCode) {
+      root._unguard(controlProcess)
       var op = root._controlOperation
       root._controlOperation = ""
       // 5 (import only) = the profile was saved but reconnecting it failed.
