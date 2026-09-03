@@ -65,6 +65,95 @@ one on — there is no exclusive "switch" any more. The master toggle in the
 panel header is the one exception: off takes every tunnel down, on brings
 back the last one you used.
 
+## Privilege
+
+`awg`/`awg-quick` need root, so every privileged step is one verb of a
+small root helper reached through polkit. The verbs split in two, along the
+line that matters — does this expose or replace a private key?
+
+Bringing a tunnel **up or down** (and listing, `awg show`, the redacted
+detail read) is passwordless on the active local session: the same posture
+NetworkManager already gives a desktop VPN, and nothing on that path prints
+a `PrivateKey`. The detail grid reads a **redacted** copy of the config —
+`PrivateKey`/`PresharedKey` come back as `(hidden)` — and `awg show dump`
+has both its interface private-key column and every peer's preshared-key
+column blanked, so the panel stays open without a prompt.
+
+`up`/`down` still change root network state without a password. That is a
+deliberate match to the NetworkManager posture, not an oversight: a control
+verb neither reveals key material nor rewrites a stored config, and the
+helper re-validates on every path that could plant an `awg-quick` hook.
+
+**Revealing or rewriting** a stored config authenticates every time, even
+on an active session: edit, export, QR, import-that-replaces, and delete
+all go through a second helper entry point with its own polkit action. Each
+of those either hands you the real key material or overwrites it, and a UI
+button press is not an authorization boundary — a compromised session
+process can press the same button. `auth_admin_keep` means one prompt
+covers a short burst (import then reconnect) rather than one per verb.
+
+The sudo fallback (`OMAWG_PRIV=sudo`) cannot draw that line and stays fully
+passwordless for wheel; it exists for setups without polkit.
+
+### What the passwordless action still exposes
+
+Being explicit about the residual surface, since it is a deliberate choice
+rather than a gap: any process in the active session can call the control
+action, and so can list the tunnel names, bring one up or down, and read the
+redacted config — addresses, DNS, MTU, the peer endpoint and its **public**
+key. No key material, no writes to a stored config, no deletion.
+
+The alternative — `auth_admin` on the control action too — costs a password
+prompt on every connect *and* on opening the panel, since the detail grid
+reads the redacted config. That is the posture of a machine where the VPN is
+an administrative setting rather than a desktop one; it is one attribute
+change in `polkit/com.omarchy.amneziawg.policy` for anyone who wants it.
+
+## Bounds and deadlines
+
+Nothing on the privileged path or on the way into the panel is unbounded.
+A config body is capped at 128 KiB, 2000 lines, 64 peers and 4 KiB per
+value, checked twice: in `backend.sh` before anything is written, and again
+in the root helper, which never trusts the caller. The helper reads stdin
+through `head -c` rather than `$(cat)`, so an endless producer is refused
+instead of being buffered as root.
+
+Every producer feeding a QML `StdioCollector` is capped at the source, since
+a collector with `waitForEnd` has no limit of its own: `backend.sh` output
+goes through a `pipefail` pipe into `head -c` that preserves the backend's
+exit code (the control and editor paths read `2`..`6` as distinct outcomes),
+and the picker, clipboard, traffic and ping snippets cap themselves.
+
+Every collecting process also runs under a watchdog. A producer that never
+closes its pipe — a wedged authentication prompt, a stuck `awg-quick` — gets
+`SIGTERM`, so its `EXIT` trap can still remove a temp file holding a private
+key, and `SIGKILL` two seconds later. The signal reaches the shell this
+widget spawned; a root descendant behind `pkexec` is already reparented and
+cannot be signalled by an unprivileged process. So the widget stops waiting
+on it and says so in the panel rather than clearing the operation silently —
+the work may still be finishing as root, and that is the honest report.
+
+## State on disk
+
+Two files live outside `/etc`: the display-name sidecar and the last-used
+tunnel marker, both under `~/.local/state/omarchy`. Neither holds a secret,
+but both name the tunnels you run and both are writable by anything running
+as you, so they are treated as untrusted.
+
+The directory is created `0700` and verified before use — a real directory,
+owned by you, not reached through a symlink, unreadable by anyone else; a
+loose mode on a directory that predates us is tightened rather than refused.
+Writes are atomic: refuse a symlinked or non-regular target, stage in a
+`mktemp` file, `fsync`, rename. Reads are no-follow, bounded, and validated
+(the marker must parse as a single interface name). A symlink found in place
+of the sidecar is skipped with a warning rather than failing the listing —
+labels are cosmetic and must not cost you the tunnel list — while a rename,
+which writes, refuses outright.
+
+`XDG_RUNTIME_DIR` gets the same privacy check but no repair: it is handed to
+us by the session, and a world-readable one is somebody else's decision and
+a signal to stop, not something to paper over.
+
 ## Importing
 
 Importing asks for a name, because the interface is named after it and the
