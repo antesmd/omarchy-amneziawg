@@ -55,7 +55,7 @@ sudo ./install.sh
 That installs the helper to `/usr/local/lib/omarchy-amneziawg-helper`, the
 polkit policy to `/usr/share/polkit-1/actions/`, and creates
 `/etc/amnezia/amneziawg` mode 0700. It is idempotent. **Log out and back in
-afterwards** so polkit loads the new action — until you do, every privileged
+afterwards** so polkit loads the new actions — until you do, every privileged
 call will prompt or fail.
 
 `awg` and `awg-quick` need root, so — unlike the NetworkManager backend this
@@ -167,22 +167,32 @@ the [design notes](docs/design.md).
 ## Security
 
 The widget runs entirely as your user. Every privileged operation goes
-through a **single small root helper**,
-`/usr/local/lib/omarchy-amneziawg-helper`, invoked via **`pkexec`**. A
-shipped polkit policy (`com.omarchy.amneziawg.policy`, action
-`com.omarchy.amneziawg.helper`, `allow_active=yes`) lets an active local
-session use it **without a password** — the same "an active session controls
-its own VPN" posture that NetworkManager + polkit gave us.
+through a **small root helper** invoked via **`pkexec`**. The same script is
+installed under two names, bound to two polkit actions in
+`com.omarchy.amneziawg.policy`, split along the line that matters — does this
+verb expose or replace a private key?
 
-The helper is a tiny `set -euf`, no-eval, verb-allowlisted script
-(`list dump getconf up down writeconf delconf`). It validates the `<iface>`
-name against `[A-Za-z0-9_=+.-]{1,15}`, refuses path traversal, refuses to
-touch anything outside `/etc/amnezia/amneziawg`, and takes config bodies on
-stdin so a key never rides on a command line.
+- `com.omarchy.amneziawg.helper.control` (`list dump up down metaconf`,
+  `allow_active=yes`) — an active local session brings its own tunnels up
+  and down **without a password**, the same posture NetworkManager + polkit
+  gave us. Nothing on this path prints key material: `metaconf` and the
+  redacted `dump` return `PrivateKey`/`PresharedKey` as `(hidden)`.
+- `com.omarchy.amneziawg.helper.secrets` (`getconf writeconf delconf`,
+  `allow_active=auth_admin_keep`) — reading back or rewriting a stored
+  config *including its keys*, or deleting a tunnel, **authenticates every
+  time**, because a UI button press is not an authorization boundary. One
+  prompt covers a short burst (import then reconnect).
+
+The helper is a tiny `set -euf`, no-eval, verb-allowlisted script. It
+validates the `<iface>` name against `[A-Za-z0-9_=+.-]{1,15}`, refuses path
+traversal, refuses to touch anything outside `/etc/amnezia/amneziawg`, takes
+config bodies on stdin so a key never rides on a command line, and caps
+config size (128 KiB, 2000 lines, 64 peers) before it acts on one.
 
 Set `OMAWG_PRIV=sudo` to invoke the helper through `sudo` instead of
-`pkexec`, using the shipped `sudoers/omarchy-amneziawg` drop-in
-(`%wheel ALL=(root) NOPASSWD: /usr/local/lib/omarchy-amneziawg-helper`).
+`pkexec`, using the shipped `sudoers/omarchy-amneziawg` drop-in. That path
+cannot draw the secrets/control line and stays fully passwordless for
+`wheel` — use it only where polkit is not an option.
 
 **`awg-quick` runs hooks.** It executes `PreUp`/`PostUp`/`PreDown`/`PostDown`
 and honours `SaveConfig`, as root. Three things keep an imported config from
@@ -206,9 +216,9 @@ outright — silently dropping them would lie about what the tunnel does. A
 rejected import changes nothing.
 
 Private keys are passed to the helper on stdin, never as command-line
-arguments — and the detail query reads `awg show` without dumping the
-config, so it never touches a secret. `install.sh` / `uninstall.sh` are the
-only privileged scripts; no services, no telemetry.
+arguments — and the detail query reads the redacted `metaconf` / `dump`, so
+it never touches a secret and never prompts. `install.sh` / `uninstall.sh`
+are the only privileged scripts; no services, no telemetry.
 
 ## What it touches
 

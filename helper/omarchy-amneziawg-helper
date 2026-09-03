@@ -1,32 +1,64 @@
 #!/bin/bash
 # omarchy-amneziawg-helper — the ONLY code that runs as root.
 #
-# Invoked via pkexec (polkit policy) or, as a fallback, sudo. It exposes a
-# tight verb allowlist for managing AmneziaWG tunnels stored under
-# /etc/amnezia/amneziawg/<iface>.conf. No eval, no argv-borne secrets:
-# config bodies arrive on stdin and are re-validated here (defense in depth —
-# a compromised unprivileged process must not be able to plant an awg-quick
-# hook that then runs as root).
+# Installed under TWO names, each bound to its own polkit action:
+#   omarchy-amneziawg-helper          list, up, down, dump, metaconf
+#                                     (passwordless on the active session)
+#   omarchy-amneziawg-helper-secrets   getconf, writeconf, delconf
+#                                     (authenticates — these expose or
+#                                      replace a PrivateKey, or delete a
+#                                      tunnel)
+# Same script; the verb allowlist is picked from $0's basename as
+# defence-in-depth behind the polkit split.
+#
+# Invoked via pkexec (polkit policy) or, as a fallback, sudo. No eval, no
+# argv-borne secrets: config bodies arrive on stdin and are re-validated
+# here (defence in depth — a compromised unprivileged process must not be
+# able to plant an awg-quick hook that then runs as root).
 set -euf
 export LC_ALL=C
 
 AWG_CONFDIR="${AWG_CONFDIR:-/etc/amnezia/amneziawg}"
 
+# Hard bounds on the config body — a privileged, stdin-fed input must not be
+# unbounded. 128 KiB is ~20x the largest sane multi-peer AmneziaWG config.
+MAX_CONF_BYTES=131072
+MAX_CONF_LINES=2000
+MAX_PEERS=64
+MAX_KEY_LEN=64
+MAX_VALUE_LEN=4096
+
 usage() {
   cat >&2 <<'EOF'
 usage: omarchy-amneziawg-helper <verb> [args]
   list                 list awg interfaces and stored conf names
-  dump <iface>         awg show <iface> dump
-  getconf <iface>      print stored <iface>.conf
+  dump <iface>         awg show <iface> dump (interface private key redacted)
+  metaconf <iface>     print stored <iface>.conf, PrivateKey/PresharedKey redacted
   up <iface>           awg-quick up <iface>
   down <iface>         awg-quick down <iface>
-  writeconf <iface>    read a config body from stdin, validate, atomically write
-  delconf <iface>      down (if up) then remove <iface>.conf
+  getconf <iface>      print stored <iface>.conf                (-secrets entry)
+  writeconf <iface>    read a config body from stdin, validate, atomically write (-secrets entry)
+  delconf <iface>      down (if up) then remove <iface>.conf    (-secrets entry)
 EOF
   exit 2
 }
 
 die() { printf 'omarchy-amneziawg-helper: %s\n' "$1" >&2; exit "${2:-1}"; }
+
+# Which verbs this entry point may run. `*-secrets` gets the key-bearing and
+# destructive verbs; the plain name gets the rest.
+case "${0##*/}" in
+  *-secrets) ENTRY=secrets ;;
+  *)         ENTRY=control ;;
+esac
+
+verb_allowed() {
+  case "$ENTRY:$1" in
+    control:list|control:dump|control:metaconf|control:up|control:down) return 0 ;;
+    secrets:getconf|secrets:writeconf|secrets:delconf) return 0 ;;
+  esac
+  return 1
+}
 
 valid_iface() {
   # regex-bounded, and explicit belt-and-braces against traversal
@@ -44,17 +76,22 @@ need_iface() {
 
 validate_body() {
   # stdin -> reject on any violation, exit 1 without writing
-  local line key kl
-  local n=0
+  local line key kl vlen
+  local n=0 peers=0
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
+    [ "$n" -le "$MAX_CONF_LINES" ] || die "config has too many lines (max $MAX_CONF_LINES)"
     # strip leading/trailing whitespace
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [ -z "$line" ] && continue
     case "$line" in
       \#*) continue ;;
-      '[Interface]'|'[Peer]') continue ;;
+      '[Interface]') continue ;;
+      '[Peer]')
+        peers=$((peers + 1))
+        [ "$peers" -le "$MAX_PEERS" ] || die "config has too many [Peer] sections (max $MAX_PEERS)"
+        continue ;;
       \[*\]) die "line $n: unknown section header: $line" ;;
     esac
     case "$line" in
@@ -63,6 +100,9 @@ validate_body() {
     esac
     key="${line%%=*}"
     key="${key%"${key##*[![:space:]]}"}"
+    [ "${#key}" -le "$MAX_KEY_LEN" ] || die "line $n: key is too long"
+    vlen="${line#*=}"
+    [ "${#vlen}" -le "$MAX_VALUE_LEN" ] || die "line $n: value is too long"
     kl="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
     case "$kl" in
       preup|postup|predown|postdown|saveconfig)
@@ -75,8 +115,37 @@ validate_body() {
   done
 }
 
+# Redact the value of PrivateKey / PresharedKey lines, keeping the key and
+# the surrounding layout. Everything else passes through verbatim.
+redact_conf() {
+  awk '
+    {
+      line = $0
+      # split on the first "="
+      e = index(line, "=")
+      if (e > 0) {
+        k = substr(line, 1, e - 1)
+        gsub(/^[ \t]+|[ \t]+$/, "", k)
+        kl = tolower(k)
+        if (kl == "privatekey" || kl == "presharedkey") {
+          pre = substr(line, 1, e)
+          print pre " (hidden)"
+          next
+        }
+      }
+      print line
+    }'
+}
+
 cmd="${1:-}"
 [ -n "$cmd" ] || usage
+verb_allowed "$cmd" || {
+  case "$cmd" in
+    getconf|writeconf|delconf) die "'$cmd' must go through omarchy-amneziawg-helper-secrets" 2 ;;
+    list|dump|metaconf|up|down) die "'$cmd' is not available on the -secrets entry point" 2 ;;
+    *) usage ;;
+  esac
+}
 shift || true
 
 case "$cmd" in
@@ -96,12 +165,33 @@ case "$cmd" in
     ;;
   dump)
     need_iface "$@"
-    exec awg show "$1" dump
+    # `awg show <iface> dump` is TAB-separated. Line 1 is the interface:
+    #   <private-key> <public-key> <listen-port> <fwmark>
+    # every later line is a peer:
+    #   <public-key> <preshared-key> <endpoint> <allowed-ips> ...
+    # Redact the interface private key (line 1, field 1) AND every peer's
+    # preshared key (field 2, unless "(none)") so this stays safe for the
+    # passwordless entry point.
+    set -o pipefail
+    awg show "$1" dump | awk -F'\t' 'BEGIN { OFS = "\t" }
+      NR == 1 && NF >= 1 { $1 = "(hidden)" }
+      NR > 1 && NF >= 2 && $2 != "(none)" { $2 = "(hidden)" }
+      { print }'
+    ;;
+  metaconf)
+    need_iface "$@"
+    f="$AWG_CONFDIR/$1.conf"
+    [ -f "$f" ] && [ ! -L "$f" ] || die "no such conf: $1"
+    sz="$(wc -c < "$f" 2>/dev/null)" || die "cannot read conf: $1"
+    [ "$sz" -le "$MAX_CONF_BYTES" ] || die "stored config is too large (max $MAX_CONF_BYTES bytes)"
+    redact_conf < "$f"
     ;;
   getconf)
     need_iface "$@"
     f="$AWG_CONFDIR/$1.conf"
-    [ -f "$f" ] || die "no such conf: $1"
+    [ -f "$f" ] && [ ! -L "$f" ] || die "no such conf: $1"
+    sz="$(wc -c < "$f" 2>/dev/null)" || die "cannot read conf: $1"
+    [ "$sz" -le "$MAX_CONF_BYTES" ] || die "stored config is too large (max $MAX_CONF_BYTES bytes)"
     exec cat "$f"
     ;;
   up)
@@ -115,7 +205,9 @@ case "$cmd" in
   writeconf)
     need_iface "$@"
     iface="$1"
-    body="$(cat)"
+    # Bounded read: at most MAX+1 bytes, reject if the extra byte showed up.
+    body="$(head -c "$((MAX_CONF_BYTES + 1))")"
+    [ "${#body}" -le "$MAX_CONF_BYTES" ] || die "config is too large (max $MAX_CONF_BYTES bytes)"
     printf '%s\n' "$body" | validate_body
     [ -d "$AWG_CONFDIR" ] || die "config dir missing: $AWG_CONFDIR"
     tmp="$(mktemp "$AWG_CONFDIR/.omazia.XXXXXX")"

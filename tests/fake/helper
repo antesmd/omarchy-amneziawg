@@ -4,8 +4,23 @@
 # the fake `awg` / `awg-quick` on PATH and does config CRUD in $FAKE_DIR:
 #   conf.<iface>          stored tunnel config body
 #   fail-delete.<iface>   if present, `delconf <iface>` fails
+# Backend routes getconf/writeconf/delconf to $OMAWG_HELPER_SECRETS and the
+# rest to $OMAWG_HELPER; tests point both at this one file.
 set -uf
 echo "helper $*" >> "$FAKE_DIR/log"
+
+# Redact PrivateKey/PresharedKey values, mirroring the real helper.
+redact() {
+  awk '{
+    e = index($0, "=")
+    if (e > 0) {
+      k = substr($0, 1, e - 1); gsub(/^[ \t]+|[ \t]+$/, "", k)
+      kl = tolower(k)
+      if (kl == "privatekey" || kl == "presharedkey") { print substr($0, 1, e) " (hidden)"; next }
+    }
+    print
+  }'
+}
 
 verb="${1:-}"; iface="${2:-}"
 
@@ -27,11 +42,21 @@ case "$verb" in
     set -f
     exit 0 ;;
   dump)
-    exec awg show "$iface" dump ;;
+    set -o pipefail
+    awg show "$iface" dump | awk -F'\t' 'BEGIN{OFS="\t"}
+      NR==1 && NF>=1 {$1="(hidden)"}
+      NR>1 && NF>=2 && $2!="(none)" {$2="(hidden)"}
+      {print}'
+    exit $? ;;
   getconf)
     [ -e "$FAKE_DIR/fail-getconf-any" ] && { echo "helper: getconf failed" >&2; exit 1; }
     [ -f "$FAKE_DIR/conf.$iface" ] || { echo "helper: no such tunnel: $iface" >&2; exit 1; }
     cat "$FAKE_DIR/conf.$iface"
+    exit 0 ;;
+  metaconf)
+    [ -e "$FAKE_DIR/fail-getconf-any" ] && { echo "helper: metaconf failed" >&2; exit 1; }
+    [ -f "$FAKE_DIR/conf.$iface" ] || { echo "helper: no such tunnel: $iface" >&2; exit 1; }
+    redact < "$FAKE_DIR/conf.$iface"
     exit 0 ;;
   up)
     exec awg-quick up "$iface" ;;
