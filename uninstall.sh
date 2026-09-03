@@ -8,6 +8,7 @@ if [ "$(id -u)" != 0 ]; then
 fi
 
 rm -f /usr/local/lib/omarchy-amneziawg-helper
+rm -f /usr/local/lib/omarchy-amneziawg-helper-secrets
 rm -f /usr/share/polkit-1/actions/com.omarchy.amneziawg.policy
 
 echo "Removed helper and polkit policy."

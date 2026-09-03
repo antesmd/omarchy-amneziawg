@@ -3,11 +3,17 @@
 #
 # AmneziaWG has no usable NetworkManager plugin, so tunnels are driven with
 # the AmneziaWG userspace tools (`awg`, `awg-quick`). Those need root, so
-# every privileged operation goes through a single small root helper
-# (helper/omarchy-amneziawg-helper) invoked via `pkexec` (or `sudo` when
-# OMAWG_PRIV=sudo). A polkit policy grants the active local session
-# passwordless use — the same "an active session controls its own VPN
-# without a password" posture NetworkManager + polkit gave us.
+# every privileged operation goes through a small root helper, installed
+# under two names bound to two polkit actions:
+#   omarchy-amneziawg-helper           list/up/down/dump/metaconf — passwordless
+#                                      on the active session (the same "an
+#                                      active session controls its own VPN
+#                                      without a password" posture
+#                                      NetworkManager + polkit gave us)
+#   omarchy-amneziawg-helper-secrets   getconf/writeconf/delconf — authenticates,
+#                                      because these reveal or replace a stored
+#                                      PrivateKey/PresharedKey or delete a tunnel
+# Both are invoked via `pkexec` (or `sudo` when OMAWG_PRIV=sudo).
 #
 # Tunnels are addressed by their **interface name** everywhere (= the conf
 # basename, /etc/amnezia/amneziawg/<iface>.conf, [A-Za-z0-9_=+.-]{1,15}).
@@ -63,12 +69,21 @@ need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed"; }
 # ---------------------------------------------------------------------------
 OMAWG_PRIV="${OMAWG_PRIV:-pkexec}"
 HELPER="${OMAWG_HELPER:-/usr/local/lib/omarchy-amneziawg-helper}"
+HELPER_SECRETS="${OMAWG_HELPER_SECRETS:-/usr/local/lib/omarchy-amneziawg-helper-secrets}"
 
 PRIV() {
+  # getconf/writeconf/delconf reveal or replace a PrivateKey, or delete a
+  # tunnel — they go through the -secrets entry point (its own polkit action,
+  # which authenticates even on an active session). Everything else is the
+  # passwordless entry point.
+  local helper="$HELPER"
+  case "${1:-}" in
+    getconf|writeconf|delconf) helper="$HELPER_SECRETS" ;;
+  esac
   case "$OMAWG_PRIV" in
-    pkexec) need pkexec; pkexec "$HELPER" "$@" ;;
-    sudo)   need sudo;   sudo -n "$HELPER" "$@" ;;
-    direct) "$HELPER" "$@" ;;
+    pkexec) need pkexec; pkexec "$helper" "$@" ;;
+    sudo)   need sudo;   sudo -n "$helper" "$@" ;;
+    direct) "$helper" "$@" ;;
     *) die "Unknown OMAWG_PRIV: $OMAWG_PRIV" ;;
   esac
 }
@@ -262,8 +277,10 @@ cmd_details() {
   valid_iface "$iface" || die "Invalid interface name: $iface"
   local dump conf line key value item
   local addr4="" addr6="" dns4="" dns6="" mtu="" live
+  # metaconf, not getconf: the grid only reads Address/DNS/MTU, never the
+  # keys, so the panel stays passwordless while it is open.
   dump="$(PRIV dump "$iface" 2>/dev/null)" || dump=""
-  conf="$(PRIV getconf "$iface" 2>/dev/null)" || conf=""
+  conf="$(PRIV metaconf "$iface" 2>/dev/null)" || conf=""
   [ -z "$dump" ] && [ -z "$conf" ] && die "No such tunnel: $iface"
 
   while IFS= read -r line; do

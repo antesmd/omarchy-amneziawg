@@ -5,7 +5,23 @@
 <policyconfig>
   <vendor>Omazia</vendor>
 
-  <action id="com.omarchy.amneziawg.helper">
+  <!--
+    Two actions, two helper entry points (same script, installed under two
+    names — pkexec binds a policy to an action by its annotated exec.path).
+
+    .control  — list/up/down/dump/metaconf. Bringing a tunnel up or down is
+                passwordless on the active local session, the posture
+                NetworkManager + polkit already give a desktop VPN. None of
+                these verbs reveal a PrivateKey/PresharedKey: dump redacts
+                the interface private key and every peer PresharedKey;
+                metaconf redacts PrivateKey and PresharedKey.
+
+    .secrets  — getconf/writeconf/delconf. These read back or replace a
+                stored config *including its keys*, or delete a tunnel, so
+                they authenticate even on an active session.
+  -->
+
+  <action id="com.omarchy.amneziawg.helper.control">
     <description>Manage AmneziaWG tunnels</description>
     <message>Authentication is required to manage AmneziaWG tunnels</message>
     <defaults>
@@ -14,6 +30,18 @@
       <allow_active>yes</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/omarchy-amneziawg-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="com.omarchy.amneziawg.helper.secrets">
+    <description>Read or modify stored AmneziaWG tunnel configuration</description>
+    <message>Authentication is required to read or modify a stored AmneziaWG tunnel configuration</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/omarchy-amneziawg-helper-secrets</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

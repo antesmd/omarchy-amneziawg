@@ -6,7 +6,7 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 backend="$here/../backend.sh"
 export PATH="$here/fake:$PATH"
-export OMAWG_PRIV=direct OMAWG_HELPER="$here/fake/helper"
+export OMAWG_PRIV=direct OMAWG_HELPER="$here/fake/helper" OMAWG_HELPER_SECRETS="$here/fake/helper"
 pass=0 fail=0
 
 run_case() { # name expected-exit setup-fn [check-expr]

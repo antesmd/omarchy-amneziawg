@@ -9,12 +9,20 @@ fi
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# One script, two names: pkexec binds a polkit action to its exec.path, so
+# the passwordless verbs and the authenticating ones need distinct binaries.
 install -D -m 0755 "$here/helper/omarchy-amneziawg-helper" \
   /usr/local/lib/omarchy-amneziawg-helper
+install -D -m 0755 "$here/helper/omarchy-amneziawg-helper" \
+  /usr/local/lib/omarchy-amneziawg-helper-secrets
 install -D -m 0644 "$here/polkit/com.omarchy.amneziawg.policy" \
   /usr/share/polkit-1/actions/com.omarchy.amneziawg.policy
 install -d -m 0700 /etc/amnezia/amneziawg
 
 cat <<'EOF'
-Installed. Log out and back in for polkit to pick up the new action. For the sudo fallback instead: install sudoers/omarchy-amneziawg to /etc/sudoers.d/ and set OMAWG_PRIV=sudo.
+Installed. Log out and back in for polkit to pick up the new actions.
+Bringing a tunnel up or down is passwordless; revealing or rewriting a
+stored config (edit, export, QR, import-replace, delete) authenticates.
+For the sudo fallback instead: install sudoers/omarchy-amneziawg to
+/etc/sudoers.d/ and set OMAWG_PRIV=sudo.
 EOF

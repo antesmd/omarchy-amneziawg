@@ -9,6 +9,12 @@ here="$(cd "$(dirname "$0")" && pwd)"
 helper="$here/../helper/omarchy-amneziawg-helper"
 pass=0 fail=0
 
+# The real helper is installed under two names; the -secrets one is the only
+# entry point that runs getconf/writeconf/delconf.
+SBIN="$(mktemp -d)"
+ln -s "$helper" "$SBIN/omarchy-amneziawg-helper-secrets"
+helper_s="$SBIN/omarchy-amneziawg-helper-secrets"
+
 expect() { # name condition-expr
   if eval "$2"; then echo "PASS $1"; pass=$((pass+1))
   else echo "FAIL $1"; fail=$((fail+1)); fi
@@ -49,7 +55,7 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25'
 
 # (a) valid writeconf -> 0600 file, matching content
-printf '%s\n' "$VALID_BODY" | bash "$helper" writeconf tun0
+printf '%s\n' "$VALID_BODY" | bash "$helper_s" writeconf tun0
 rc=$?
 expect "writeconf valid: exit 0" "[ $rc = 0 ]"
 expect "writeconf valid: file exists" '[ -f "$CONF/tun0.conf" ]'
@@ -59,13 +65,13 @@ expect "writeconf valid: content round-trips" \
   '[ "$(cat "$CONF/tun0.conf")" = "$VALID_BODY" ]'
 
 # (e) getconf prints back what writeconf stored
-got="$(bash "$helper" getconf tun0)"
+got="$(bash "$helper_s" getconf tun0)"
 expect "getconf returns stored body" '[ "$got" = "$VALID_BODY" ]'
 
 # (b) bad iface names rejected, nothing written
 for bad in "../etc/passwd" "foo/bar" "aaaaaaaaaaaaaaaa"; do
   before="$(ls -A "$CONF")"
-  printf '%s\n' "$VALID_BODY" | bash "$helper" writeconf "$bad" >/dev/null 2>&1
+  printf '%s\n' "$VALID_BODY" | bash "$helper_s" writeconf "$bad" >/dev/null 2>&1
   rc=$?
   after="$(ls -A "$CONF")"
   expect "iface '$bad' rejected non-zero" "[ $rc != 0 ]"
@@ -77,7 +83,7 @@ HOOK_BODY='[Interface]
 PrivateKey = aaaa
 PostUp = touch /tmp/pwned'
 before="$(ls -A "$CONF")"
-printf '%s\n' "$HOOK_BODY" | bash "$helper" writeconf hooky >/dev/null 2>&1
+printf '%s\n' "$HOOK_BODY" | bash "$helper_s" writeconf hooky >/dev/null 2>&1
 rc=$?
 expect "PostUp body rejected non-zero" "[ $rc != 0 ]"
 expect "PostUp body: no file written" '[ ! -e "$CONF/hooky.conf" ]'
@@ -87,7 +93,7 @@ expect "PostUp body: confdir unchanged" '[ "$before" = "$(ls -A "$CONF")" ]'
 UNK_BODY='[Interface]
 PrivateKey = aaaa
 Foo = bar'
-printf '%s\n' "$UNK_BODY" | bash "$helper" writeconf unk >/dev/null 2>&1
+printf '%s\n' "$UNK_BODY" | bash "$helper_s" writeconf unk >/dev/null 2>&1
 rc=$?
 expect "unknown key rejected non-zero" "[ $rc != 0 ]"
 expect "unknown key: no file written" '[ ! -e "$CONF/unk.conf" ]'
@@ -103,7 +109,68 @@ expect "list emits a --- separator line" 'printf "%s\n" "$list_out" | grep -qx -
 expect "list: conf basename appears after the separator" \
   '[ "$(printf "%s\n" "$list_out" | grep -nx -- --- | cut -d: -f1)" -lt "$(printf "%s\n" "$list_out" | grep -nx tun0 | cut -d: -f1)" ]'
 
-rm -rf "$BIN" "$CONF"
+# --- entry-point split (defence in depth behind the polkit actions) -------
+for v in getconf writeconf delconf; do
+  printf '%s\n' "$VALID_BODY" | bash "$helper" "$v" tun0 >/dev/null 2>&1
+  expect "plain entry point refuses '$v'" "[ $? != 0 ]"
+done
+for v in list up down dump metaconf; do
+  bash "$helper_s" "$v" tun0 >/dev/null 2>&1
+  expect "-secrets entry point refuses '$v'" "[ $? != 0 ]"
+done
+
+# --- metaconf redacts the keys but keeps the routable facts ---------------
+SECRET_BODY='[Interface]
+PrivateKey = PRIVSECRET123=
+Address = 10.9.9.9/32
+DNS = 9.9.9.9
+MTU = 1280
+
+[Peer]
+PublicKey = PUBKEY=
+PresharedKey = PSKSECRET456='
+printf '%s\n' "$SECRET_BODY" | bash "$helper_s" writeconf redact
+meta="$(bash "$helper" metaconf redact)"
+expect "metaconf hides PrivateKey" 'printf "%s" "$meta" | grep -q "PrivateKey = (hidden)" && ! printf "%s" "$meta" | grep -q PRIVSECRET123'
+expect "metaconf hides PresharedKey" 'printf "%s" "$meta" | grep -q "PresharedKey = (hidden)" && ! printf "%s" "$meta" | grep -q PSKSECRET456'
+expect "metaconf keeps Address/DNS/MTU" \
+  'printf "%s" "$meta" | grep -q "Address = 10.9.9.9/32" && printf "%s" "$meta" | grep -q "DNS = 9.9.9.9" && printf "%s" "$meta" | grep -q "MTU = 1280"'
+
+# --- dump redacts the interface private key and every peer PresharedKey --
+cat > "$BIN/awg" <<'EOF'
+#!/bin/bash
+[ "$1" = show ] && [ "$3" = dump ] && {
+  printf 'IFACEPRIV=\tIFACEPUB=\t51820\toff\n'
+  printf 'PEERPUB1=\tPSKSECRET1=\t1.2.3.4:51820\t0.0.0.0/0\t0\t0\t0\t0\n'
+  printf 'PEERPUB2=\t(none)\t5.6.7.8:51820\t10.0.0.0/24\t0\t0\t0\t0\n'
+  exit 0
+}
+exit 0
+EOF
+chmod +x "$BIN/awg"
+dump_out="$(bash "$helper" dump tun0)"
+expect "dump redacts the interface private key" \
+  '! printf "%s\n" "$dump_out" | grep -q IFACEPRIV && printf "%s\n" "$dump_out" | head -1 | grep -q "(hidden)" && printf "%s\n" "$dump_out" | grep -q IFACEPUB'
+expect "dump redacts a peer PresharedKey" \
+  '! printf "%s\n" "$dump_out" | grep -q PSKSECRET1 && [ "$(printf "%s\n" "$dump_out" | grep -c "(hidden)")" = 2 ]'
+expect "dump keeps peer public keys and a (none) PSK" \
+  'printf "%s\n" "$dump_out" | grep -q PEERPUB1 && printf "%s\n" "$dump_out" | grep -q PEERPUB2 && printf "%s\n" "$dump_out" | grep -q "(none)"'
+
+# --- resource bounds ----------------------------------------------------
+before="$(ls -A "$CONF")"
+head -c $((131072 + 100)) /dev/zero | tr '\0' 'x' | bash "$helper_s" writeconf toobig >/dev/null 2>&1
+expect "oversized body rejected" "[ $? != 0 ]"
+expect "oversized body wrote nothing" '[ "$before" = "$(ls -A "$CONF")" ]'
+
+{ echo '[Interface]'; echo 'PrivateKey = k'; for i in $(seq 1 2100); do echo "# pad $i"; done; } |
+  bash "$helper_s" writeconf toolong >/dev/null 2>&1
+expect "over-2000-line body rejected" "[ $? != 0 ] && [ ! -e \"\$CONF/toolong.conf\" ]"
+
+{ echo '[Interface]'; echo 'PrivateKey = k'; for i in $(seq 1 70); do echo '[Peer]'; echo "PublicKey = p$i="; done; } |
+  bash "$helper_s" writeconf toomany >/dev/null 2>&1
+expect "over-64-peer body rejected" "[ $? != 0 ] && [ ! -e \"\$CONF/toomany.conf\" ]"
+
+rm -rf "$BIN" "$CONF" "$SBIN"
 echo "----"
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
