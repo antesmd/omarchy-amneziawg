@@ -11,9 +11,8 @@ release.
       or prompt until it does.
 - [ ] After re-login, a connect from the bar goes through without a
       password prompt: `pkexec` never asks on an active local session.
-- [ ] `OMAWG_PRIV=sudo` run of the backend works too, authorized by
-      `/etc/sudoers.d/omarchy-amneziawg` instead of the polkit policy — no
-      password, no polkit dialog.
+- [ ] Editing/exporting/QR/import-replace/delete raises exactly one polkit
+      auth dialog, then a short burst reuses it (`auth_admin_keep`).
 - [ ] `sudo ./uninstall.sh` removes the helper and policy and leaves
       `/etc/amnezia/amneziawg/*.conf` in place.
 
