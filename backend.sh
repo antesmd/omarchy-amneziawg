@@ -13,7 +13,8 @@
 #   omarchy-amneziawg-helper-secrets   getconf/writeconf/delconf — authenticates,
 #                                      because these reveal or replace a stored
 #                                      PrivateKey/PresharedKey or delete a tunnel
-# Both are invoked via `pkexec` (or `sudo` when OMAWG_PRIV=sudo).
+# Both are invoked via `pkexec` — polkit is the only privilege path. A
+# desktop without a polkit agent is unsupported.
 #
 # Tunnels are addressed by their **interface name** everywhere (= the conf
 # basename, /etc/amnezia/amneziawg/<iface>.conf, [A-Za-z0-9_=+.-]{1,15}).
@@ -69,11 +70,9 @@ die() { printf '%s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed"; }
 
 # ---------------------------------------------------------------------------
-# Privilege wrapper: every root operation is one verb of the helper.
-# OMAWG_PRIV=pkexec (default) prompts nothing on an active local session
-# thanks to the polkit policy; =sudo uses the shipped sudoers drop-in;
-# =direct runs the helper as-is (the test suite points OMAWG_HELPER at a
-# fake and never needs root).
+# Privilege wrapper: every root operation is one verb of the helper, run
+# through pkexec so polkit decides. OMAWG_PRIV=direct is a test-only escape
+# hatch — the suite points OMAWG_HELPER at a fake and never needs root.
 # ---------------------------------------------------------------------------
 OMAWG_PRIV="${OMAWG_PRIV:-pkexec}"
 HELPER="${OMAWG_HELPER:-/usr/local/lib/omarchy-amneziawg-helper}"
@@ -90,7 +89,6 @@ PRIV() {
   esac
   case "$OMAWG_PRIV" in
     pkexec) need pkexec; pkexec "$helper" "$@" ;;
-    sudo)   need sudo;   sudo -n "$helper" "$@" ;;
     direct) "$helper" "$@" ;;
     *) die "Unknown OMAWG_PRIV: $OMAWG_PRIV" ;;
   esac
