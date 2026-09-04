@@ -60,8 +60,7 @@ call will prompt or fail.
 
 `awg` and `awg-quick` need root, so — unlike the NetworkManager backend this
 widget grew from — this one-time step is unavoidable. See
-[Security](#security) for what the helper does and how to run it through
-`sudo` instead of `pkexec`.
+[Security](#security) for what the helper does.
 
 ## Using it
 
@@ -189,10 +188,9 @@ traversal, refuses to touch anything outside `/etc/amnezia/amneziawg`, takes
 config bodies on stdin so a key never rides on a command line, and caps
 config size (128 KiB, 2000 lines, 64 peers) before it acts on one.
 
-Set `OMAWG_PRIV=sudo` to invoke the helper through `sudo` instead of
-`pkexec`, using the shipped `sudoers/omarchy-amneziawg` drop-in. That path
-cannot draw the secrets/control line and stays fully passwordless for
-`wheel` — use it only where polkit is not an option.
+`pkexec`/polkit is the only privilege path — a desktop without a polkit
+agent is unsupported. (`OMAWG_PRIV=direct` exists solely for the test suite,
+which points the helper at a fake and never touches root.)
 
 **`awg-quick` runs hooks.** It executes `PreUp`/`PostUp`/`PreDown`/`PostDown`
 and honours `SaveConfig`, as root. Three things keep an imported config from

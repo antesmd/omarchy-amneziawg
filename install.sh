@@ -23,6 +23,4 @@ cat <<'EOF'
 Installed. Log out and back in for polkit to pick up the new actions.
 Bringing a tunnel up or down is passwordless; revealing or rewriting a
 stored config (edit, export, QR, import-replace, delete) authenticates.
-For the sudo fallback instead: install sudoers/omarchy-amneziawg to
-/etc/sudoers.d/ and set OMAWG_PRIV=sudo.
 EOF

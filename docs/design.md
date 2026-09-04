@@ -92,8 +92,13 @@ button press is not an authorization boundary — a compromised session
 process can press the same button. `auth_admin_keep` means one prompt
 covers a short burst (import then reconnect) rather than one per verb.
 
-The sudo fallback (`OMAWG_PRIV=sudo`) cannot draw that line and stays fully
-passwordless for wheel; it exists for setups without polkit.
+There is no `sudo` fallback. polkit is the only privilege path: it is the
+one mechanism that can draw the control/secrets line *and* raise a GUI auth
+prompt from a bar widget that has no controlling terminal. A sudoers
+drop-in could do neither without either going fully passwordless (which
+erases the secrets boundary for every wheel process in the session) or
+needing an askpass helper the widget cannot rely on. A desktop without a
+polkit agent is unsupported.
 
 ### What the passwordless action still exposes
 
