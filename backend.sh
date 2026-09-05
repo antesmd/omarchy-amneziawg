@@ -344,14 +344,16 @@ cmd_details() {
     live="$(cat "/sys/class/net/$iface/mtu" 2>/dev/null)" && [ -n "$live" ] && mtu="$live"
   fi
 
-  local n=0 endpoint="" allowed="" pub psk ep aips rest
+  local n=0 endpoint="" allowed="" handshake="" keepalive="" pub psk ep aips hs rx tx ka
   if [ -n "$dump" ]; then
-    while read -r pub psk ep aips rest; do
+    while read -r pub psk ep aips hs rx tx ka; do
       n=$((n + 1))
       [ "$n" -le 1 ] && continue
       if [ "$n" -eq 2 ]; then
         [ -n "$ep" ] && [ "$ep" != "(none)" ] && endpoint="$ep"
         [ -n "$aips" ] && [ "$aips" != "(none)" ] && allowed="${aips//,/, }"
+        handshake="$hs"
+        keepalive="$ka"
       fi
     done <<< "$dump"
   fi
@@ -367,6 +369,27 @@ cmd_details() {
   printf 'dns=%s\n' "${dns//,/, }"
   printf 'mtu=%s\n' "$mtu"
   printf 'peers=%s\n' "$peers"
+  printf 'handshake=%s\n' "$handshake"
+  printf 'keepalive=%s\n' "$keepalive"
+}
+
+# Latest-handshake timestamps for the CONFIGS list rows — one line per
+# iface, "iface=<unix-seconds-or-0>". A dump that fails (interface gone
+# mid-poll) is skipped rather than aborting the rest, since this feeds a
+# best-effort caption, not something a caller needs to trust completely.
+cmd_handshakes() {
+  local iface dump n pub psk ep aips hs rest
+  for iface in "$@"; do
+    valid_iface "$iface" || continue
+    dump="$(PRIV dump "$iface" 2>/dev/null)" || continue
+    n=0
+    hs="0"
+    while read -r pub psk ep aips hs rest; do
+      n=$((n + 1))
+      [ "$n" -eq 2 ] && break
+    done <<< "$dump"
+    printf '%s=%s\n' "$iface" "${hs:-0}"
+  done
 }
 
 # Non-exclusive activation: bring one tunnel up and leave every other active
@@ -800,6 +823,7 @@ cmd_edit() {
 case "${1:-}" in
   status) cmd_status ;;
   details) cmd_details "$2" ;;
+  handshakes) shift; cmd_handshakes "$@" ;;
   up) lock; cmd_up "$2" ;;
   down) lock; cmd_down "$2" ;;
   down-all) lock; cmd_down_all ;;
