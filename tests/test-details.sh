@@ -37,17 +37,19 @@ field() { printf '%s\n' "$out" | sed -n "s/^$1=//p"; }
 
 fresh
 out="$(bash "$backend" details pm 2>/dev/null)"; rc=$?
-expect "happy path: address, endpoint, routes, dns, peer count" \
+expect "happy path: address, endpoint, routes, dns, peer count, handshake, keepalive" \
   '[ "$rc" = 0 ] && [ "$(field ip)" = "10.8.0.13/32" ] \
     && [ "$(field endpoint)" = "185.55.56.151:51820" ] \
     && [ "$(field allowed)" = "0.0.0.0/0, 192.0.2.0/24" ] \
     && [ "$(field dns)" = "8.8.8.8, 1.1.1.1" ] \
-    && [ "$(field peers)" = "1" ]'
+    && [ "$(field peers)" = "1" ] \
+    && [ "$(field handshake)" = "1699999999" ] \
+    && [ "$(field keepalive)" = "25" ]'
 
 fresh
 out="$(bash "$backend" details pm 2>/dev/null)"
 expect "every key is printed even when the tunnel has no value for it" \
-  '[ "$(printf "%s\n" "$out" | wc -l)" = 7 ] && [ "$(field mtu)" = "" ] && [ "$(field ip6)" = "" ]'
+  '[ "$(printf "%s\n" "$out" | wc -l)" = 9 ] && [ "$(field mtu)" = "" ] && [ "$(field ip6)" = "" ]'
 
 fresh
 out="$(bash "$backend" details pm 2>/dev/null)"
@@ -67,6 +69,14 @@ out="$(bash "$backend" details pm 2>/dev/null)"
 expect "multi-peer tunnel: first peer described, all peers counted" \
   '[ "$(field peers)" = "2" ] && [ "$(field endpoint)" = "203.0.113.7:1234" ] \
     && [ "$(field allowed)" = "192.0.2.0/24" ]'
+
+fresh
+out="$(bash "$backend" handshakes pm 2>/dev/null)"
+expect "handshakes: one line per iface" '[ "$out" = "pm=1699999999" ]'
+
+fresh
+out="$(bash "$backend" handshakes pm nope 2>/dev/null)"
+expect "handshakes: a missing tunnel is skipped, not fatal" '[ "$out" = "pm=1699999999" ]'
 
 echo "----"
 echo "$pass passed, $fail failed"

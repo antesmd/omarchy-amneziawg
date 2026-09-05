@@ -67,6 +67,11 @@ Item {
   // session totals: awg-quick creates the interface at activation,
   // so they are zero at connect by construction.
   property var traffic: ({})
+  // device -> latest-handshake unix-seconds string, for every active
+  // tunnel's row caption. Unlike `traffic` this needs a privileged `awg
+  // show dump` per device, so it is sampled less often and only while the
+  // panel is open.
+  property var handshakes: ({})
 
   readonly property var activeDevices: {
     var out = []
@@ -230,6 +235,25 @@ Item {
     trafficProcess.running = true
   }
 
+  // One backend.sh call covering every active device, rather than one
+  // privileged `awg show dump` process per row.
+  function sampleHandshakes() {
+    if (handshakesProcess.running || activeDevices.length === 0) return
+    handshakesProcess.command = backendCommand(["handshakes"].concat(activeDevices))
+    handshakesProcess.running = true
+  }
+
+  function applyHandshakes(raw) {
+    var next = {}
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      var pos = lines[i].indexOf("=")
+      if (pos <= 0) continue
+      next[lines[i].slice(0, pos)] = lines[i].slice(pos + 1)
+    }
+    handshakes = next
+  }
+
   function fetchDetails() {
     if (detailsProcess.running || inspectedIfnameEffective === "") return
     _detailsFor = inspectedIfnameEffective
@@ -343,6 +367,35 @@ Item {
     return hasPing ? String(percent) + "%" : "--"
   }
 
+  // A handshake age, from a unix-seconds timestamp — "0" (or unset) means
+  // the peer has never answered.
+  function fmtHandshake(ts) {
+    var v = Number(ts)
+    if (!isFinite(v) || v <= 0) return "Never"
+    var age = Math.floor(Date.now() / 1000) - v
+    if (age < 0) age = 0
+    if (age < 10) return "just now"
+    if (age < 60) return age + "s ago"
+    if (age < 3600) return Math.floor(age / 60) + "m ago"
+    if (age < 86400) return Math.floor(age / 3600) + "h ago"
+    return Math.floor(age / 86400) + "d ago"
+  }
+
+  // The live 5s poll wins once it has a sample for this device; until then
+  // (right after switching the inspected tunnel) this falls back to the
+  // one-shot value `fetchDetails` already fetched, so the row shows
+  // something immediately instead of "Never" for a few seconds.
+  function handshakeFor(dev) {
+    var v = handshakes[String(dev || "")]
+    return v !== undefined ? v : detail("handshake")
+  }
+
+  function fmtKeepalive(v) {
+    var s = String(v || "").trim()
+    if (s === "" || s === "0" || s === "off") return "Off"
+    return s + "s"
+  }
+
   // Live counters for one device, or zeros — the grid keeps its rows in
   // place from the moment a tunnel comes up, so it needs an answer before
   // the first sample lands.
@@ -387,18 +440,25 @@ Item {
     parts.push("rx=" + trafficTotal(primaryDevice, "rx") + " (" + trafficRate(primaryDevice, "rxRate") + ")")
     parts.push("tx=" + trafficTotal(primaryDevice, "tx") + " (" + trafficRate(primaryDevice, "txRate") + ")")
     parts.push("ping=" + fmtPing(pingLatency) + " loss=" + fmtLoss(pingLoss))
+    parts.push("handshake=" + fmtHandshake(handshakeFor(primaryDevice)))
     if (peerCount > 1) parts.push("peers=" + peerCount + " (first shown)")
     return parts.join(" · ")
   }
 
-  // One caption line: current rate, then session totals. Empty until there
-  // is something live to say — the row falls back to its plain state text,
-  // which beats a line of stale numbers.
+  // One caption line: current rate, then session totals, then the last
+  // handshake — this is what lets a row other than the inspected one say
+  // whether it is actually alive without being clicked. Handshake is
+  // sampled independently of traffic (its own privileged poll), so a
+  // device with no sample yet just omits it rather than blocking the rest
+  // of the line.
   function trafficLine(dev) {
     var t = traffic[String(dev || "")]
     if (!trafficLive(t)) return ""
-    return "↓ " + fmtBytes(t.rxRate) + "/s ↑ " + fmtBytes(t.txRate) + "/s"
+    var line = "↓ " + fmtBytes(t.rxRate) + "/s ↑ " + fmtBytes(t.txRate) + "/s"
       + " · ↓ " + fmtBytes(t.rx) + " ↑ " + fmtBytes(t.tx)
+    var hs = handshakes[String(dev || "")]
+    if (hs !== undefined) line += " · " + fmtHandshake(hs)
+    return line
   }
 
   // First profile with this name, or null. Only for the name-based entry
@@ -1163,6 +1223,17 @@ Item {
     onTriggered: root.sampleTraffic()
   }
 
+  // Slower than the traffic tick: each sample costs a privileged `awg show
+  // dump` per active device, unlike traffic's plain /sys read, and a
+  // handshake age is meaningful to the second, not the fraction of one.
+  Timer {
+    interval: 5000
+    repeat: true
+    running: root.trafficMonitoring && root.activeDevices.length > 0
+    triggeredOnStart: true
+    onTriggered: root.sampleHandshakes()
+  }
+
   // Slower than the traffic tick on purpose: a probe can sit for its whole
   // 2s timeout, and a 30s window of ten samples is what makes the loss
   // figure mean anything.
@@ -1419,6 +1490,21 @@ Item {
     onExited: function(exitCode) {
       root._unguard(trafficProcess)
       if (exitCode === 0) root.applyTraffic(trafficStdout.text)
+    }
+  }
+
+  Process {
+    id: handshakesProcess
+    running: false
+    command: []
+    onStarted: root._guard(handshakesProcess, "handshakes", 20000)
+    stdout: StdioCollector {
+      id: handshakesStdout
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root._unguard(handshakesProcess)
+      if (exitCode === 0) root.applyHandshakes(handshakesStdout.text)
     }
   }
 
