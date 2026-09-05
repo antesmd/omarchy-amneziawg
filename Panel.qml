@@ -762,6 +762,18 @@ Panel {
                 valueColor: wireguard.pingLoss > 0 ? root.urgent : root.foreground
               }
 
+              // The one number ping can't give you: whether the crypto
+              // session itself is current, not just whether something
+              // answers ICMP through it.
+              DetailPair {
+                label: "Latest Handshake"
+                value: wireguard.fmtHandshake(wireguard.handshakeFor(wireguard.inspectedDevice))
+              }
+              DetailPair {
+                label: "Persistent Keepalive"
+                value: wireguard.fmtKeepalive(wireguard.detail("keepalive"))
+              }
+
               // "--" until a rate has actually been measured: the first
               // sample of a session has no interval behind it, and printing
               // its zero would claim an idle tunnel on no evidence.
