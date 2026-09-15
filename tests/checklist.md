@@ -119,16 +119,6 @@ release.
       a code owned by a live sibling shell remains. (A reused PID is the
       residual, extremely narrow limitation.)
 
-## Notifications
-
-- [ ] With a tunnel up, `sudo awg-quick down <iface>` from a terminal →
-      one toast "Tunnel <iface> was deactivated", bar icon turns urgent.
-- [ ] Disconnecting from the panel/bar produces **no** toast.
-- [ ] With two monitors (two widget instances), the external drop still
-      produces exactly one toast.
-- [ ] Reboot or `systemctl restart` a boot-time tunnel unit with a tunnel
-      up — toast appears, widget recovers on the next poll.
-
 ## Editing
 
 - [ ] Pencil → Config closes the panel, and zenity comes up focused rather

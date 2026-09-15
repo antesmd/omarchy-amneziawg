@@ -210,10 +210,6 @@ Item {
       return false
     }
     actionRejection = ""
-    // The observation time for mark-active is when this snapshot is
-    // *requested* — anything that happens while the poll runs or waits to
-    // be parsed is "after the observation" and must keep its marker.
-    _statusStartedAt = Math.floor(Date.now() / 1000)
     statusProcess.running = true
     return true
   }
@@ -549,32 +545,6 @@ Item {
       byIfname[ifname].active = true
       if (firstUp === "") firstUp = ifname
     }
-    // Transitions against the previous poll. Every profile that went down
-    // is queued for notify-drop — the backend's intent markers decide,
-    // under the lock, which drops were ours; judging only the first could
-    // hide an external drop behind an intentional one. Every profile that
-    // came up re-arms its marker via mark-active, so an activation the
-    // widget merely observed (awg-quick up) gets its notifications back.
-    var droppedNow = []
-    for (var ifname0 in _prevActive) {
-      var cur = byIfname[ifname0]
-      if (cur === undefined || !cur.active) droppedNow.push({ ifname: ifname0, name: _prevActive[ifname0] })
-    }
-    var nowActive = {}
-    var observedAt = String(_statusStartedAt > 0 ? _statusStartedAt : Math.floor(Date.now() / 1000))
-    for (var k = 0; k < list.length; k++) {
-      if (!list[k].active) continue
-      nowActive[list[k].ifname] = list[k].name
-      // Queued, not fired directly: the process may be busy, and a lost
-      // activation would leave a stale marker muting a real drop for up to
-      // the TTL. The observation time rides along so a delayed mark-active
-      // cannot erase the record of a down that happened after it.
-      if (_prevActive[list[k].ifname] === undefined) _markQueue.push(list[k].ifname + ":" + observedAt)
-    }
-    _prevActive = nowActive
-    for (var d = 0; d < droppedNow.length; d++) _dropQueue.push(droppedNow[d])
-    _flushDrops()
-    _flushMarkActive()
     // Sorted after the active flags are in, because the flag is the first
     // sort key: what is up is what the panel is opened for, and the grid
     // above describes the profile that lands at the top. Name breaks ties,
@@ -840,22 +810,10 @@ Item {
   Component.onCompleted: {
     Quickshell.execDetached(["bash", backendPath, "cleanup-runtime"])
     lastFileProcess.running = true
-  }
-
-  function _flushDrops() {
-    if (notifyProcess.running || _dropQueue.length === 0) return
-    var drop = _dropQueue.shift()
-    _notifyDropName = drop.name
-    notifyProcess.command = backendCommand(["notify-drop", drop.ifname, drop.name])
-    notifyProcess.running = true
-  }
-
-  function _flushMarkActive() {
-    if (markActiveProcess.running || _markQueue.length === 0) return
-    _markInFlight = _markQueue
-    _markQueue = []
-    markActiveProcess.command = ["bash", "-c", markActiveScript, "amneziawg", backendPath].concat(_markInFlight)
-    markActiveProcess.running = true
+    // One-shot, not the start of continuous polling: without it the bar
+    // icon shows nothing active right after a shell (re)start, even with a
+    // tunnel already up, until the panel is opened and its timer fires.
+    root.refresh()
   }
 
   // Puts rejected text back in front of the user with the reason showing.
@@ -1114,30 +1072,10 @@ Item {
   // tunnel's ifname. _pingFor does the same for the probe in flight.
   property string _detailsFor: ""
   property string _pingFor: ""
-  // ifname -> name of the tunnels active at the previous status poll.
-  property var _prevActive: ({})
-  property string _notifyDropName: ""
-  // Observed drops waiting for their notify-drop verdict, one at a time.
-  property var _dropQueue: []
-  // Observed activations ("ifname:epoch") waiting to re-arm their markers,
-  // and the batch currently being processed — returned to the queue if the
-  // backend fails (clear_intent is idempotent, so replays are safe).
-  property var _markQueue: []
-  property var _markInFlight: []
-  // Epoch seconds of the moment the running status poll was requested.
-  property double _statusStartedAt: 0
   // False once the QR window closed — a result arriving afterwards is
   // deleted, not displayed.
   property bool _qrWanted: false
 
-  // Each argument is "ifname:observed-epoch"; ifnames contain no colons. Every
-  // pair is attempted; any failure fails the batch, which the caller then
-  // requeues whole — replays are idempotent.
-  readonly property string markActiveScript:
-    "be=\"$1\"; shift\n" +
-    "rc=0\n" +
-    "for pair in \"$@\"; do bash \"$be\" mark-active \"${pair%%:*}\" \"${pair#*:}\" || rc=1; done\n" +
-    "exit $rc\n"
   property string _editIfname: ""
   property string _editName: ""
   property string _editSeed: ""
@@ -1446,43 +1384,6 @@ Item {
       } else {
         // 2 = qrencode missing, with the install hint on stderr.
         root.qrError = root.elide(qrStderr.text || "Could not render the QR code")
-      }
-    }
-  }
-
-  Process {
-    id: notifyProcess
-    running: false
-    command: []
-    onStarted: root._guard(notifyProcess, "notify-drop", 20000)
-    onExited: function(exitCode) {
-      root._unguard(notifyProcess)
-      var name = root._notifyDropName
-      root._notifyDropName = ""
-      // 0 = the backend judged the drop external. The message lands in
-      // lastError so the bar icon turns urgent and the panel says why; any
-      // successful operation clears it, like every other error.
-      if (exitCode === 0 && name !== "") root.lastError = "Profile " + name + " was deactivated"
-      Qt.callLater(root._flushDrops)
-    }
-  }
-
-  Process {
-    id: markActiveProcess
-    running: false
-    command: []
-    onStarted: root._guard(markActiveProcess, "mark-active", 30000)
-    onExited: function(exitCode) {
-      root._unguard(markActiveProcess)
-      if (exitCode === 0) {
-        root._markInFlight = []
-        // Drain whatever queued while this batch ran.
-        Qt.callLater(root._flushMarkActive)
-      } else {
-        // Give the batch back and retry on the next poll — an immediate
-        // retry against a persistently failing backend would spin.
-        root._markQueue = root._markInFlight.concat(root._markQueue)
-        root._markInFlight = []
       }
     }
   }
