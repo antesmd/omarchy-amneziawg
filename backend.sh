@@ -49,7 +49,6 @@
 #   qr-png <iface>              render the config as a QR PNG in XDG_RUNTIME_DIR
 #   cleanup-runtime             remove QR/editor files owned by a dead shell
 #   edit <iface> <name>         zenity editor round-trip (seed text on stdin)
-#   notify-drop <iface> <name>  decide whether a deactivation was external
 
 set -u
 set -o pipefail
@@ -153,78 +152,6 @@ ensure_state_dir() {
   # last-tunnel marker name the tunnels this user runs.
   [ -d "$d" ] || mkdir -p -m 700 -- "$d" || die "Cannot create $d"
   ensure_private_dir "$d" "the state directory" fix
-}
-
-# ---------------------------------------------------------------------------
-# Intent markers: immediately before this script deactivates a tunnel it
-# records the iface, under the flock; notify-drop consults the file to tell
-# a user-initiated drop from an external one. A marker is cleared the moment
-# the same iface comes up again. The TTL is only a garbage-collection
-# backstop; it must exceed the widget's slowest poll (refreshIntervalSec
-# caps at 3600).
-# ---------------------------------------------------------------------------
-INTENT_TTL=7200
-
-runtime_state() {
-  ensure_runtime_dir
-  printf '%s/omarchy-amneziawg.%s.%s' "$RUNTIME_DIR" "$(id -u)" "$1"
-}
-
-mark_down() { # <iface>
-  local iface="$1" f now u t keep=""
-  f="$(runtime_state intent)"
-  now="$(date +%s)"
-  if [ -f "$f" ]; then
-    while read -r u t; do
-      case "$t" in ''|*[!0-9]*) continue ;; esac
-      [ "$u" = "$iface" ] && continue
-      [ $((now - t)) -gt "$INTENT_TTL" ] && continue
-      keep="$keep$u $t"$'\n'
-    done < "$f"
-  fi
-  printf '%s' "$keep$iface $now"$'\n' > "$f" 2>/dev/null || true
-}
-
-# clear_intent <iface> [observed-epoch]: drop the iface's marker. With an
-# observation timestamp, only a marker strictly older is dropped (a tie
-# keeps the marker — the conservative miss is a suppressed toast).
-clear_intent() {
-  local iface="$1" obs="${2:-}" f now u t keep=""
-  f="$(runtime_state intent)"
-  now="$(date +%s)"
-  [ -f "$f" ] || return 0
-  case "$obs" in *[!0-9]*) obs="" ;; esac
-  while read -r u t; do
-    case "$t" in ''|*[!0-9]*) continue ;; esac
-    [ $((now - t)) -gt "$INTENT_TTL" ] && continue
-    if [ "$u" = "$iface" ]; then
-      if [ -z "$obs" ] || [ "$t" -lt "$obs" ]; then continue; fi
-    fi
-    keep="$keep$u $t"$'\n'
-  done < "$f"
-  printf '%s' "$keep" > "$f" 2>/dev/null || true
-}
-
-cmd_notify_drop() {
-  local iface="$1" name="$2" f now t u
-  now="$(date +%s)"
-  f="$(runtime_state intent)"
-  if [ -f "$f" ]; then
-    while read -r u t; do
-      case "$t" in ''|*[!0-9]*) continue ;; esac
-      if [ "$u" = "$iface" ] && [ $((now - t)) -le "$INTENT_TTL" ]; then exit 1; fi
-    done < "$f"
-  fi
-  f="$(runtime_state notified)"
-  if [ -f "$f" ]; then
-    t="$(cat "$f" 2>/dev/null)" || t=0
-    case "$t" in ''|*[!0-9]*) t=0 ;; esac
-    [ $((now - t)) -lt 30 ] && exit 0
-  fi
-  printf '%s' "$now" > "$f" 2>/dev/null || true
-  command -v notify-send >/dev/null 2>&1 || exit 0
-  notify-send -a Omazia "Omazia" "Tunnel $name was deactivated" 2>/dev/null || true
-  exit 0
 }
 
 valid_key() { printf '%s\n' "$1" | awg pubkey >/dev/null 2>&1; }
@@ -406,33 +333,28 @@ cmd_up() {
   valid_iface "$target" || die "Invalid interface name: $target"
   if active_ifaces | grep -qxF "$target"; then exit 0; fi
   out="$(PRIV up "$target" 2>&1)" || {
-    clear_intent "$target"
     printf 'Could not activate the tunnel: %s\n' "$out" >&2
     exit 1
   }
-  clear_intent "$target"
 }
 
 cmd_down() {
   valid_iface "$1" || die "Invalid interface name: $1"
-  mark_down "$1"
-  PRIV down "$1" || { clear_intent "$1"; exit 1; }
+  PRIV down "$1" || exit 1
 }
 
 cmd_down_all() {
   local rc=0 u active
   active="$(active_ifaces)" || die "Could not list active tunnels"
   for u in $active; do
-    mark_down "$u"
-    PRIV down "$u" || { clear_intent "$u"; rc=1; }
+    PRIV down "$u" || rc=1
   done
   exit "$rc"
 }
 
 cmd_delete() {
   valid_iface "$1" || die "Invalid interface name: $1"
-  mark_down "$1"
-  PRIV delconf "$1" || { clear_intent "$1"; exit 1; }
+  PRIV delconf "$1" || exit 1
   drop_label "$1"
 }
 
@@ -693,16 +615,14 @@ cmd_import() {
     local stage=".import.$$"
     printf '%s\n' "$body" | PRIV writeconf "$stage" || die "Could not stage the new config"
     if [ "$old_was_active" = 1 ]; then
-      mark_down "$old"
       PRIV down "$old" || {
-        clear_intent "$old"
         PRIV delconf "$stage" >/dev/null 2>&1 || true
         die "Could not deactivate the old tunnel"
       }
     fi
     PRIV delconf "$old" || {
       PRIV delconf "$stage" >/dev/null 2>&1 || true
-      if [ "$old_was_active" = 1 ] && PRIV up "$old" >/dev/null 2>&1; then clear_intent "$old"; fi
+      if [ "$old_was_active" = 1 ]; then PRIV up "$old" >/dev/null 2>&1 || true; fi
       die "Could not remove the old tunnel"
     }
     local staged
@@ -718,16 +638,13 @@ cmd_import() {
     carry_label "$old" "$iface"
     if [ "$old_was_active" = 1 ]; then
       PRIV up "$iface" || { echo "Saved, but reconnecting failed" >&2; exit 5; }
-      clear_intent "$iface"
     fi
   else
     # Fresh import, or an in-place edit (old == iface).
     printf '%s\n' "$body" | PRIV writeconf "$iface" || die "Could not write the config"
     if [ "$iface_was_active" = 1 ]; then
-      mark_down "$iface"
       PRIV down "$iface" >/dev/null 2>&1 || true
       PRIV up "$iface" || { echo "Saved, but reconnecting failed" >&2; exit 5; }
-      clear_intent "$iface"
     fi
   fi
 }
@@ -838,8 +755,6 @@ case "${1:-}" in
   delete) lock; cmd_delete "$2" ;;
   rename) lock; cmd_rename "$2" "$3" ;;
   import) lock; cmd_import "$2" "${3:-}" "${4:-}" ;;
-  notify-drop) lock; cmd_notify_drop "$2" "$3" ;;
-  mark-active) lock; clear_intent "$2" "${3:-}" ;;
   export) cmd_export "$2" ;;
   export-file) cmd_export_file "$2" "$3" ;;
   qr-png) cmd_qr_png "$2" ;;
