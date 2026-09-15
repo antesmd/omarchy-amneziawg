@@ -810,6 +810,10 @@ Item {
   Component.onCompleted: {
     Quickshell.execDetached(["bash", backendPath, "cleanup-runtime"])
     lastFileProcess.running = true
+    // One-shot, not the start of continuous polling: without it the bar
+    // icon shows nothing active right after a shell (re)start, even with a
+    // tunnel already up, until the panel is opened and its timer fires.
+    root.refresh()
   }
 
   // Puts rejected text back in front of the user with the reason showing.
