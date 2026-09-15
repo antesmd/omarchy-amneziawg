@@ -230,6 +230,10 @@ cmd_notify_drop() {
 valid_key() { printf '%s\n' "$1" | awg pubkey >/dev/null 2>&1; }
 
 is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
+# H1-H4 (unlike S1-S4) accept "lo-hi" as well as a plain value — awg-quick's
+# own parser (u32_range_from_string in type.c) already supports this, and
+# the stock Amnezia app now exports magic headers as ranges by default.
+is_num_or_range() { [[ "$1" =~ ^[0-9]+(-[0-9]+)?$ ]]; }
 
 valid_iface() { [[ "$1" =~ ^[A-Za-z0-9_=+.-]{1,15}$ ]] && [ "$1" != "." ] && [ "$1" != ".." ]; }
 
@@ -572,8 +576,12 @@ parse_config() {
             is_num "$value" || die "Invalid $key: $value"
             canon="J${key:1}"
             AWG_PARAMS+=("$canon = $value") ;;
-          s1|s2|s3|s4|h1|h2|h3|h4)
+          s1|s2|s3|s4)
             is_num "$value" || die "Invalid $key: $value"
+            canon="${key^^}"
+            AWG_PARAMS+=("$canon = $value") ;;
+          h1|h2|h3|h4)
+            is_num_or_range "$value" || die "Invalid $key: $value"
             canon="${key^^}"
             AWG_PARAMS+=("$canon = $value") ;;
           i1|i2|i3|i4|i5)
