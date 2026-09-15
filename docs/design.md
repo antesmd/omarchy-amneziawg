@@ -197,14 +197,6 @@ per key, so two devices sharing a config kick each other offline on every
 handshake. File export exists too, IPC-only: `exportConfig` writes a 0600
 `.conf` atomically.
 
-## Notifications
-
-When a tunnel is deactivated by something other than this widget —
-`awg-quick down` in a terminal, a reboot, a dying network — the bar icon
-turns urgent and one toast says "Tunnel X was deactivated". Disconnects you
-asked for stay silent, and several widget instances (one per monitor)
-coordinate through a lock so you get one toast, not one per screen.
-
 ## Editing
 
 Editing closes the panel and shows the config as `awg-quick`-style text in

@@ -32,8 +32,6 @@ endorsed by, or connected to the AmneziaWG or WireGuard projects.
 - **`wl-clipboard`** — optional, for importing a config from the clipboard
   and copying connection details.
 - **`qrencode`** — optional, for showing a tunnel as a QR code.
-- **`notify-send`** (libnotify) — optional, for the toast when a tunnel is
-  deactivated externally.
 
 ## Install
 
@@ -117,10 +115,6 @@ transactional — see the [design notes](docs/design.md).
 **QR export** renders the tunnel in its own centred window; the PNG lives in
 `XDG_RUNTIME_DIR` (0600) and is deleted on close. The code contains **the
 private key** — scanning it *moves* the tunnel, it does not add a device.
-
-**Notifications.** When a tunnel is deactivated by something other than this
-widget, the bar icon turns urgent and one toast says "Tunnel X was
-deactivated". Disconnects you asked for stay silent.
 
 **Editing** shows the config as `awg-quick`-style text in zenity, secrets
 included. Saving over a running tunnel rewrites the config and brings the
@@ -229,11 +223,10 @@ are the only privileged scripts; no services, no telemetry.
   touches a `.conf`.
 - `~/.local/state/omarchy/amneziawg-last` — the interface name of the last
   tunnel you connected, so the bar's quick toggle reconnects what you used.
-- `$XDG_RUNTIME_DIR/omarchy-amneziawg.<uid>.{lock,intent,notified}` — the
-  cross-instance lock, the "this deactivation was ours" markers behind the
-  notifications, and the toast cooldown stamp. The backend requires a
-  private, current-user runtime directory (or its `/run/user/<uid>`
-  fallback) and refuses to use `/tmp`. Gone at reboot.
+- `$XDG_RUNTIME_DIR/omarchy-amneziawg.<uid>.lock` — the cross-instance lock
+  serializing mutating commands. The backend requires a private,
+  current-user runtime directory (or its `/run/user/<uid>` fallback) and
+  refuses to use `/tmp`. Gone at reboot.
 - `$XDG_RUNTIME_DIR/omazia-qr.<shell-pid>.*.png` — the QR image while its
   window is open; deleted on close, dead-PID images reaped on next startup.
 - `$XDG_RUNTIME_DIR/omazia-edit.<shell-pid>.*` — private editor buffers and
