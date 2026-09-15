@@ -1205,10 +1205,19 @@ Item {
     }
   }
 
+  // Gated on trafficMonitoring (== the panel is open, see Panel.qml) rather
+  // than always-on: every connect/disconnect happens through this panel, so
+  // the moment it changes anything it's already open and refreshing, and
+  // there is nothing external to notice while it's shut. Previously this
+  // ran pkexec through the root helper every refreshIntervalSec (10s by
+  // default) forever, even with zero tunnels configured — a real, constant
+  // background cost (fork + D-Bus + polkit auth + a root process) for
+  // information nobody was looking at. Trade-off: a tunnel dying while the
+  // panel is closed won't produce a drop notification until it's reopened.
   Timer {
     interval: root.refreshIntervalSec * 1000
     repeat: true
-    running: true
+    running: root.trafficMonitoring
     triggeredOnStart: true
     onTriggered: root.refresh()
   }
