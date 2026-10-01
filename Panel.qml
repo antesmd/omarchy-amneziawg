@@ -693,6 +693,7 @@ Panel {
             visible: wireguard.actionStatus !== "" || wireguard.lastError !== ""
             width: parent.width
             text: wireguard.actionStatus !== "" ? wireguard.actionStatus : wireguard.lastError
+            textFormat: Text.PlainText
             color: wireguard.lastError !== "" && wireguard.actionStatus === "" ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -1174,6 +1175,7 @@ Panel {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       text: pair.value
+      textFormat: Text.PlainText
       color: pair.valueColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -1250,6 +1252,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           text: configRow.profile ? configRow.profile.name : ""
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -1269,6 +1272,7 @@ Panel {
             var line = wireguard.trafficLine(configRow.profile ? configRow.profile.ifname : "")
             return line !== "" ? line : "Connected — click to view"
           }
+          textFormat: Text.PlainText
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
