@@ -123,6 +123,7 @@ PanelWindow {
         Text {
           width: parent.width
           text: root.name
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
@@ -144,6 +145,7 @@ PanelWindow {
           width: parent.width
           visible: root.error !== ""
           text: root.error
+          textFormat: Text.PlainText
           color: root.urgent
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
