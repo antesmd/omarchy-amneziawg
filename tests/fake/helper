@@ -9,14 +9,14 @@
 set -uf
 echo "helper $*" >> "$FAKE_DIR/log"
 
-# Redact PrivateKey/PresharedKey values, mirroring the real helper.
+# Redact PrivateKey/PresharedKey/HeaderProtectionKey values, mirroring the real helper.
 redact() {
   awk '{
     e = index($0, "=")
     if (e > 0) {
       k = substr($0, 1, e - 1); gsub(/^[ \t]+|[ \t]+$/, "", k)
       kl = tolower(k)
-      if (kl == "privatekey" || kl == "presharedkey") { print substr($0, 1, e) " (hidden)"; next }
+      if (kl == "privatekey" || kl == "presharedkey" || kl == "headerprotectionkey") { print substr($0, 1, e) " (hidden)"; next }
     }
     print
   }'

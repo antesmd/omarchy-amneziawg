@@ -125,6 +125,9 @@ PrivateKey = PRIVSECRET123=
 Address = 10.9.9.9/32
 DNS = 9.9.9.9
 MTU = 1280
+HeaderProtectionKey = HPKSECRET789=
+RekeyAfterTime = 100-120
+RandomTrailers = on
 
 [Peer]
 PublicKey = PUBKEY=
@@ -133,6 +136,9 @@ printf '%s\n' "$SECRET_BODY" | bash "$helper_s" writeconf redact
 meta="$(bash "$helper" metaconf redact)"
 expect "metaconf hides PrivateKey" 'printf "%s" "$meta" | grep -q "PrivateKey = (hidden)" && ! printf "%s" "$meta" | grep -q PRIVSECRET123'
 expect "metaconf hides PresharedKey" 'printf "%s" "$meta" | grep -q "PresharedKey = (hidden)" && ! printf "%s" "$meta" | grep -q PSKSECRET456'
+expect "writeconf accepts AmneziaWG 3.x keys" '[ -f "$CONF/redact.conf" ]'
+expect "metaconf hides HeaderProtectionKey but keeps the other 3.x keys" \
+  'printf "%s" "$meta" | grep -q "HeaderProtectionKey = (hidden)" && ! printf "%s" "$meta" | grep -q HPKSECRET789 && printf "%s" "$meta" | grep -q "RekeyAfterTime = 100-120"'
 expect "metaconf keeps Address/DNS/MTU" \
   'printf "%s" "$meta" | grep -q "Address = 10.9.9.9/32" && printf "%s" "$meta" | grep -q "DNS = 9.9.9.9" && printf "%s" "$meta" | grep -q "MTU = 1280"'
 

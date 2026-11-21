@@ -415,7 +415,9 @@ cmd_rename() {
 # import: parse awg-quick/wg-quick config text, emit canonical text, hand it
 # to the helper. Hooks (PreUp/PostUp/...) are rejected with a clear message.
 # AmneziaWG obfuscation keys (Jc Jmin Jmax S1..S4 H1..H4 I1..I5) pass through
-# verbatim under canonical casing.
+# verbatim under canonical casing, and so do the AmneziaWG 3.x keys
+# (HeaderProtectionKey, Rekey*/Reject*/Keepalive timeouts, MaxHandshakeAttempts,
+# RandomTrailers, DisableCookies).
 # ---------------------------------------------------------------------------
 PK="" PORT="" MTU="" FWMARK="" TABLE=""
 ADDR4="" ADDR6="" DNS4="" DNS6="" DNSSEARCH=""
@@ -512,6 +514,26 @@ parse_config() {
             [ "${#value}" -le 1024 ] || die "$key value is too long"
             canon="${key^^}"
             AWG_PARAMS+=("$canon = $value") ;;
+          headerprotectionkey)
+            valid_key "$value" || die "Invalid HeaderProtectionKey — not a valid key"
+            AWG_PARAMS+=("HeaderProtectionKey = $value") ;;
+          rekeyaftertime|rekeytimeout|rejectaftertime|keepalivetimeout|maxhandshakeattempts)
+            is_num_or_range "$value" || die "Invalid $key: $value"
+            case "${key,,}" in
+              rekeyaftertime) canon=RekeyAfterTime ;;
+              rekeytimeout) canon=RekeyTimeout ;;
+              rejectaftertime) canon=RejectAfterTime ;;
+              keepalivetimeout) canon=KeepaliveTimeout ;;
+              maxhandshakeattempts) canon=MaxHandshakeAttempts ;;
+            esac
+            AWG_PARAMS+=("$canon = $value") ;;
+          randomtrailers|disablecookies)
+            case "${value,,}" in on|off) ;; *) die "Invalid $key: $value (expected on or off)" ;; esac
+            case "${key,,}" in
+              randomtrailers) canon=RandomTrailers ;;
+              disablecookies) canon=DisableCookies ;;
+            esac
+            AWG_PARAMS+=("$canon = ${value,,}") ;;
           preup|postup|predown|postdown)
             die "$key is not supported: awg-quick would run it as root" ;;
           saveconfig)
@@ -534,7 +556,8 @@ parse_config() {
           endpoint)
             P_ENDPOINT="$value" ;;
           persistentkeepalive)
-            is_num "$value" || die "Invalid PersistentKeepalive: $value"
+            # AmneziaWG 3.x accepts a "lo-hi" range here as well as a plain value.
+            is_num_or_range "$value" || die "Invalid PersistentKeepalive: $value"
             P_KA="$value" ;;
           *)
             die "Unsupported [Peer] key: $key" ;;

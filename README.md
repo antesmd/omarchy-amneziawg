@@ -201,9 +201,12 @@ running commands:
 key by key. Keys must pass `awg pubkey`. Supported under `[Interface]`:
 `Address`, `DNS`, `ListenPort`, `MTU`, `FwMark`, `Table`, and the AmneziaWG
 obfuscation parameters `Jc`, `Jmin`, `Jmax`, `S1`–`S4`, `H1`–`H4`, `I1`–`I5`
-— passed through verbatim under canonical casing. Under `[Peer]`:
-`PublicKey`, `PresharedKey`, `AllowedIPs`, `Endpoint`,
-`PersistentKeepalive`. Hook directives and unknown keys are rejected
+and the AmneziaWG 3.x keys `HeaderProtectionKey`, `RekeyAfterTime`,
+`RekeyTimeout`, `RejectAfterTime`, `KeepaliveTimeout`,
+`MaxHandshakeAttempts`, `RandomTrailers`, `DisableCookies` — passed through
+verbatim under canonical casing. Under `[Peer]`: `PublicKey`,
+`PresharedKey`, `AllowedIPs`, `Endpoint`, `PersistentKeepalive` (a value or
+a `lo-hi` range). Hook directives and unknown keys are rejected
 outright — silently dropping them would lie about what the tunnel does. A
 rejected import changes nothing.
 

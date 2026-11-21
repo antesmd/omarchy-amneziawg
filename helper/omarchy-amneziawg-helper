@@ -107,7 +107,7 @@ validate_body() {
     case "$kl" in
       preup|postup|predown|postdown|saveconfig)
         die "line $n: '$key' is not allowed (awg-quick would run it as root)" ;;
-      privatekey|publickey|presharedkey|address|dns|listenport|mtu|fwmark|table|allowedips|endpoint|persistentkeepalive|jc|jmin|jmax|s1|s2|s3|s4|h1|h2|h3|h4|i1|i2|i3|i4|i5)
+      privatekey|publickey|presharedkey|address|dns|listenport|mtu|fwmark|table|allowedips|endpoint|persistentkeepalive|jc|jmin|jmax|s1|s2|s3|s4|h1|h2|h3|h4|i1|i2|i3|i4|i5|headerprotectionkey|rekeyaftertime|rekeytimeout|rejectaftertime|keepalivetimeout|maxhandshakeattempts|randomtrailers|disablecookies)
         continue ;;
       *)
         die "line $n: unknown key: $key" ;;
@@ -115,7 +115,7 @@ validate_body() {
   done
 }
 
-# Redact the value of PrivateKey / PresharedKey lines, keeping the key and
+# Redact the value of PrivateKey / PresharedKey / HeaderProtectionKey lines, keeping the key and
 # the surrounding layout. Everything else passes through verbatim.
 redact_conf() {
   awk '
@@ -127,7 +127,7 @@ redact_conf() {
         k = substr(line, 1, e - 1)
         gsub(/^[ \t]+|[ \t]+$/, "", k)
         kl = tolower(k)
-        if (kl == "privatekey" || kl == "presharedkey") {
+        if (kl == "privatekey" || kl == "presharedkey" || kl == "headerprotectionkey") {
           pre = substr(line, 1, e)
           print pre " (hidden)"
           next
