@@ -105,6 +105,29 @@ out="$(bash "$backend" export wg0 2>/dev/null)"
 done_case "AmneziaWG params survive import -> export" \
   'printf "%s\n" "$out" | grep -qx "Jc = 4" && printf "%s\n" "$out" | grep -qx "S1 = 50" && printf "%s\n" "$out" | grep -qx "H1 = 123"'
 
+# --- AmneziaWG 3.x keys ---------------------------------------------------
+awg3body() { # [extra-interface-line]
+  printf '%s\n' '[Interface]' 'PrivateKey = test-private-key' 'Address = 10.0.0.2/32' \
+    'Jc = 4' 'headerprotectionkey = test-header-key' 'RekeyAfterTime = 100-120' \
+    'RekeyTimeout = 3-7' 'RejectAfterTime = 150-180' 'KeepaliveTimeout = 5-15' \
+    'MaxHandshakeAttempts = 15' 'RandomTrailers = ON' 'DisableCookies = off' ${1:+"$1"} '' \
+    '[Peer]' 'PublicKey = test-peer-key' 'AllowedIPs = 0.0.0.0/0' 'PersistentKeepalive = 25-35'
+}
+fresh
+awg3body | bash "$backend" import wg0 >/dev/null 2>&1; awg3_rc=$?
+out="$(bash "$backend" export wg0 2>/dev/null)"
+done_case "AmneziaWG 3.x keys survive import -> export under canonical casing" \
+  '[ "$awg3_rc" = 0 ] && for l in "HeaderProtectionKey = test-header-key" "RekeyAfterTime = 100-120" \
+      "RekeyTimeout = 3-7" "RejectAfterTime = 150-180" "KeepaliveTimeout = 5-15" \
+      "MaxHandshakeAttempts = 15" "RandomTrailers = on" "DisableCookies = off" \
+      "PersistentKeepalive = 25-35"; do printf "%s\n" "$out" | grep -qx "$l" || exit 1; done'
+
+fresh
+awg3body 'RandomTrailers = maybe' | bash "$backend" import wg0 >/dev/null 2>&1; sw_rc=$?
+awg3body 'RekeyTimeout = 3-x' | bash "$backend" import wg1 >/dev/null 2>&1; rg_rc=$?
+done_case "malformed AmneziaWG 3.x values are rejected and nothing is written" \
+  '[ "$sw_rc" != 0 ] && [ "$rg_rc" != 0 ] && ! [ -e "$FAKE_DIR/conf.wg0" ] && ! [ -e "$FAKE_DIR/conf.wg1" ]'
+
 # --- hook rejection ------------------------------------------------------
 fresh
 printf '%s\n' '[Interface]' 'PrivateKey = k' 'PostUp = /bin/evil' | bash "$backend" import wg0 >/dev/null 2>&1; hook_rc=$?
